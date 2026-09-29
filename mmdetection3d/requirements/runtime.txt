@@ -1,0 +1,9 @@
+lyft_dataset_sdk
+networkx
+numba
+numpy<1.24
+nuscenes-devkit
+plyfile
+scikit-image
+tensorboard
+trimesh
