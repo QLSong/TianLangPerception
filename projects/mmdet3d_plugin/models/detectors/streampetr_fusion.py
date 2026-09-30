@@ -80,6 +80,24 @@ def _set_requires_grad(module, enabled):
         param.requires_grad = enabled
 
 
+def _freeze_det_constants(head):
+    """检测头里的常量不能跟着任务开关被重新打开。
+
+    code_weights 乘在框回归的 L1 上。它一旦可训练，梯度就是绝对误差，
+    优化器会把它一路减小；变成负数后 loss 变成负的，而且框的梯度反向，
+    误差越大 loss 越负。
+    """
+    if head is None:
+        return
+    for name in ('code_weights', 'match_costs', 'pc_range', 'position_range', 'coords_d'):
+        param = getattr(head, name, None)
+        if torch.is_tensor(param):
+            param.requires_grad = False
+    points = getattr(head, 'pseudo_reference_points', None)
+    if points is not None:
+        points.weight.requires_grad = False
+
+
 def voxelize_pillars(points, voxel_size, pc_range, max_points, max_voxels):
     """把一帧点云收成 pillar，计算留在点所在的设备上。
 
@@ -193,6 +211,7 @@ class StreamPETRFusion(Petr3D):
         _set_requires_grad(self.lidar_backbone, self.use_lidar and (train_det or train_occ))
         _set_requires_grad(self.lidar_occ_fuse, self.use_lidar and train_occ)
         _set_requires_grad(self.pts_bbox_head, train_det)
+        _freeze_det_constants(self.pts_bbox_head)
         _set_requires_grad(self.img_view_transformer, train_occ)
         _set_requires_grad(self.bev_backbone, train_occ)
         _set_requires_grad(self.bev_neck, train_occ)

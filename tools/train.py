@@ -34,6 +34,9 @@ def parse_args():
     parser.add_argument(
         '--resume-from', help='the checkpoint file to resume from')
     parser.add_argument(
+        '--load-from',
+        help='预训练权重，只加载模型参数，不恢复优化器和迭代数')
+    parser.add_argument(
         '--no-validate',
         action='store_true',
         help='whether not to evaluate the checkpoint during training')
@@ -147,6 +150,10 @@ def main():
     # if args.resume_from is not None:
     if args.resume_from is not None and osp.isfile(args.resume_from):
         cfg.resume_from = args.resume_from
+    if args.load_from is not None:
+        if not osp.isfile(args.load_from):
+            raise FileNotFoundError(f'预训练权重不存在: {args.load_from}')
+        cfg.load_from = args.load_from
     if args.gpu_ids is not None:
         cfg.gpu_ids = args.gpu_ids
     else:
@@ -198,6 +205,10 @@ def main():
 
     # log some basic info
     logger.info(f'Distributed training: {distributed}')
+    if cfg.get('resume_from'):
+        logger.info(f'Resume from {cfg.resume_from}')
+    elif cfg.get('load_from'):
+        logger.info(f'Load pretrained weights from {cfg.load_from}')
     logger.info(f'Config:\n{cfg.pretty_text}')
 
     # set random seeds
@@ -222,6 +233,39 @@ def main():
         logger.info("Using SyncBN")
         
     logger.info(f'Model:\n{model}')
+
+    def _display_width(text):
+        return sum(2 if ord(ch) > 127 else 1 for ch in text)
+
+    def _pad(text, width, align='left'):
+        gap = ' ' * (width - _display_width(text))
+        return gap + text if align == 'right' else text + gap
+
+    param_rows = []
+    for name, module in model.named_children():
+        count = sum(param.numel() for param in module.parameters())
+        trainable = sum(param.numel() for param in module.parameters() if param.requires_grad)
+        if count:
+            param_rows.append((name, f'{count:,}', f'{trainable:,}'))
+    count = sum(param.numel() for param in model.parameters())
+    trainable = sum(param.numel() for param in model.parameters() if param.requires_grad)
+    param_rows.append(('合计', f'{count:,}', f'{trainable:,}'))
+    header = ('模块', '参数量', '可训练')
+    widths = [
+        max(_display_width(header[col]), *(_display_width(row[col]) for row in param_rows))
+        for col in range(3)]
+    rule = '+-' + '-+-'.join('-' * width for width in widths) + '-+'
+
+    def _row(cells):
+        padded = [_pad(cell, width, 'left' if col == 0 else 'right')
+                  for col, (cell, width) in enumerate(zip(cells, widths))]
+        return '| ' + ' | '.join(padded) + ' |'
+
+    param_lines = ['参数量:', rule, _row(header), rule]
+    for row in param_rows[:-1]:
+        param_lines.append(_row(row))
+    param_lines.extend([rule, _row(param_rows[-1]), rule])
+    logger.info('\n'.join(param_lines))
     datasets = [build_dataset(cfg.data.train)]
     if len(cfg.workflow) == 2:
         val_dataset = copy.deepcopy(cfg.data.val)

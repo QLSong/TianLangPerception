@@ -42,7 +42,7 @@ class BEVOCCHead2D(BaseModule):
         if use_predicter:
             self.predicter = nn.Sequential(
                 nn.Linear(self.out_dim, self.out_dim * 2),
-                nn.Softplus(),
+                nn.ReLU(),
                 nn.Linear(self.out_dim * 2, num_classes * Dz),
             )
         self.use_mask = use_mask
