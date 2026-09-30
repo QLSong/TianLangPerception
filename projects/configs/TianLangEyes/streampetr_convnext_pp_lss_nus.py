@@ -84,6 +84,17 @@ model = dict(
         sid=False,
         collapse_z=True,
         downsample=16),
+    # 按高度平面投影再聚合。启用时注释掉上面的 LSSViewTransformer。
+    # img_view_transformer=dict(
+    #     type='PlaneViewTransformer',
+    #     grid_config=dict(
+    #         x=[lidar_pc_range[0], lidar_pc_range[3], _bev_step],
+    #         y=[lidar_pc_range[1], lidar_pc_range[4], _bev_step]),
+    #     input_size=(256, 704),
+    #     in_channels=256,
+    #     out_channels=64,
+    #     downsample=16,
+    #     bev_planes=(-1.0, 0.0, 1.0, 2.0)),
     bev_backbone=dict(
         type='UNet',
         in_channels=64,

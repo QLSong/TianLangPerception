@@ -24,7 +24,7 @@
                 "WORLD_SIZE": "1"
             },
             "args": [
-                "projects/configs/TianLangEyes/streampetr_convnext_pp_lss_nus_mini.py",
+                "projects/configs/TianLangEyes/streampetr_convnext_pp_lss_nus.py",
                 "--seed",
                 "0",
                 "--launcher",

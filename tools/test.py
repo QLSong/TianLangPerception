@@ -3,9 +3,21 @@
 # ---------------------------------------------
 #  Modified by Zhiqi Li
 # ---------------------------------------------
+'''
+python tools/test.py projects/configs/TianLangEyes/streampetr_convnext_pp_lss_nus.py CKPT \
+  --launcher pytorch --eval det occ \
+  --vis-dir work_dirs/vis_val --vis-interval 50 --score-thr 0.3
+'''
 import argparse
-import mmcv
+import math
 import os
+import os.path as osp
+import sys
+
+sys.path.insert(0, osp.dirname(osp.dirname(osp.abspath(__file__))))
+
+import mmcv
+import numpy as np
 import torch
 import warnings
 from mmcv import Config, DictAction
@@ -14,15 +26,16 @@ from mmcv.parallel import MMDataParallel, MMDistributedDataParallel
 from mmcv.runner import (get_dist_info, init_dist, load_checkpoint,
                          wrap_fp16_model)
 
-from mmdet3d.apis import single_gpu_test
 from mmdet3d.datasets import build_dataset
 from projects.mmdet3d_plugin.datasets.builder import build_dataloader
 from mmdet3d.models import build_model
 from mmdet.apis import set_random_seed
-from projects.mmdet3d_plugin.core.apis.test import custom_multi_gpu_test
-from mmdet.datasets import replace_ImageToTensor
-import time
-import os.path as osp
+from projects.mmdet3d_plugin.core.apis.test import collect_results_cpu
+from projects.mmdet3d_plugin.core.evaluation.det_metrics import evaluate_det, pack_boxes
+from projects.mmdet3d_plugin.core.evaluation.occ_metrics import OccMeter, crop_occ
+from projects.mmdet3d_plugin.datasets.nuscenes_dataset import lidar_to_ego_matrix
+from projects.mmdet3d_plugin.datasets.pipelines.loading import _index_occ_root
+import torch.distributed as dist
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -58,6 +71,11 @@ def parse_args():
         '--tmpdir',
         help='tmp directory used for collecting results from multiple '
         'workers, available when gpu-collect is not specified')
+    parser.add_argument('--score-thr', type=float, default=0.3,
+                        help='precision/recall 和渲染用的分数阈值')
+    parser.add_argument('--vis-dir', help='抽帧渲染的输出目录')
+    parser.add_argument('--vis-interval', type=int, default=0,
+                        help='每隔多少帧渲染一张，0 表示不渲染')
     parser.add_argument('--seed', type=int, default=0, help='random seed')
     parser.add_argument(
         '--deterministic',
@@ -106,14 +124,70 @@ def parse_args():
     return args
 
 
+def task_names(cfg):
+    tasks = cfg.model.get('tasks', 'det')
+    if isinstance(tasks, str):
+        return ('det', 'occ') if tasks == 'both' else (tasks,)
+    return tuple(tasks)
+
+
+def eval_tasks(requested, tasks):
+    if not requested:
+        return set()
+    wanted = set()
+    for name in requested:
+        if name in ('det', 'bbox', 'mAP'):
+            wanted.add('det')
+        elif name in ('occ', 'miou', 'mIoU', 'rayiou', 'RayIoU'):
+            wanted.add('occ')
+    return wanted & set(tasks)
+
+
+def sampler_indices(n, rank, world_size):
+    """和 DistributedSampler(shuffle=False) 相同的下标，含末尾补齐。"""
+    if n == 0:
+        return []
+    total = math.ceil(n / world_size) * world_size
+    indices = (list(range(n)) * math.ceil(total / n))[:total]
+    per = total // world_size
+    return indices[rank * per:(rank + 1) * per]
+
+
+def reduce_occ(meter):
+    if not (dist.is_available() and dist.is_initialized()):
+        return
+    parts = (meter.hist, meter.gt_cnt, meter.pred_cnt, meter.tp_cnt)
+    flat = np.concatenate([part.reshape(-1) for part in parts])
+    tensor = torch.tensor(flat, dtype=torch.float64, device='cuda')
+    dist.all_reduce(tensor)
+    values = tensor.cpu().numpy()
+    offset = 0
+    for part in parts:
+        size = part.size
+        part[:] = values[offset:offset + size].reshape(part.shape)
+        offset += size
+
+
+def take_pred_boxes(result, score_thr):
+    pred = result.get('pts_bbox')
+    if pred is None:
+        return None, None, None
+    keep = pred['scores_3d'] >= score_thr
+    return pred['boxes_3d'][keep], pred['labels_3d'][keep], pred['scores_3d'][keep]
+
+
 def main():
     args = parse_args()
 
     assert args.out or args.eval or args.format_only or args.show \
-        or args.show_dir, \
+        or args.show_dir or args.vis_dir, \
         ('Please specify at least one operation (save/eval/format/show the '
          'results / save the results) with the argument "--out", "--eval"'
-         ', "--format-only", "--show" or "--show-dir"')
+         ', "--format-only", "--show", "--show-dir" or "--vis-dir"')
+    if args.vis_dir and args.vis_interval <= 0:
+        raise ValueError('--vis-dir 需要 --vis-interval 大于 0')
+    if args.format_only:
+        raise ValueError('检测框在自车系，不再导出 nuScenes json。指标用 --eval det 或 --eval occ')
 
     if args.eval and args.format_only:
         raise ValueError('--eval and --format_only cannot be both specified')
@@ -158,29 +232,27 @@ def main():
         torch.backends.cudnn.benchmark = True
 
     cfg.model.pretrained = None
-    # in case the test dataset is concatenated
+    # 时序记忆按帧更新，测试固定每次一个样本。
     samples_per_gpu = 1
     if isinstance(cfg.data.test, dict):
         cfg.data.test.test_mode = True
-        samples_per_gpu = cfg.data.test.pop('samples_per_gpu', 1)
-        if samples_per_gpu > 1:
-            # Replace 'ImageToTensor' to 'DefaultFormatBundle'
-            cfg.data.test.pipeline = replace_ImageToTensor(
-                cfg.data.test.pipeline)
+        cfg.data.test.pop('samples_per_gpu', None)
     elif isinstance(cfg.data.test, list):
         for ds_cfg in cfg.data.test:
             ds_cfg.test_mode = True
-        samples_per_gpu = max(
-            [ds_cfg.pop('samples_per_gpu', 1) for ds_cfg in cfg.data.test])
-        if samples_per_gpu > 1:
-            for ds_cfg in cfg.data.test:
-                ds_cfg.pipeline = replace_ImageToTensor(ds_cfg.pipeline)
+            ds_cfg.pop('samples_per_gpu', None)
 
     # init distributed env first, since logger depends on the dist info.
     if args.launcher == 'none':
         distributed = False
     else:
         distributed = True
+        if args.launcher == 'pytorch' and 'RANK' not in os.environ:
+            os.environ.setdefault('MASTER_ADDR', '127.0.0.1')
+            os.environ.setdefault('MASTER_PORT', '29501')
+            os.environ['RANK'] = '0'
+            os.environ['WORLD_SIZE'] = '1'
+            os.environ.setdefault('LOCAL_RANK', str(args.local_rank))
         init_dist(args.launcher, **cfg.dist_params)
 
     # set random seeds
@@ -221,40 +293,106 @@ def main():
         model.PALETTE = dataset.PALETTE
 
     if not distributed:
-        assert False
-        # model = MMDataParallel(model, device_ids=[0])
-        # outputs = single_gpu_test(model, data_loader, args.show, args.show_dir)
+        model = MMDataParallel(model.cuda(), device_ids=[0])
     else:
         model = MMDistributedDataParallel(
             model.cuda(),
             device_ids=[torch.cuda.current_device()],
             broadcast_buffers=False)
-        outputs = custom_multi_gpu_test(model, data_loader, args.tmpdir,
-                                        args.gpu_collect)
 
-    rank, _ = get_dist_info()
+    tasks = task_names(cfg)
+    metrics = eval_tasks(args.eval, tasks)
+    show_det = 'det' in tasks
+    show_occ = 'occ' in tasks
+    rank, world_size = get_dist_info()
+    if rank == 0 and args.eval:
+        skipped = []
+        for name in args.eval:
+            kind = 'det' if name in ('det', 'bbox', 'mAP') else 'occ' if name in (
+                'occ', 'miou', 'mIoU', 'rayiou', 'RayIoU') else None
+            if kind and kind not in tasks:
+                skipped.append(kind)
+        if skipped:
+            print('配置 task={}，跳过 {}'.format(cfg.model.get('tasks'), '、'.join(skipped)))
+    indices = sampler_indices(len(dataset), rank, world_size)
+    det_records = []
+    occ_meter = OccMeter() if 'occ' in metrics else None
+    occ_index = _index_occ_root(cfg.occ_root) if (show_occ and (occ_meter or args.vis_dir)) else {}
+    label_range = list(cfg.model.occ_head.get(
+        'occ_label_range', [-40.0, -40.0, -1.0, 40.0, 40.0, 5.4]))
+    grid = cfg.model.img_view_transformer.grid_config if show_occ else None
+    if args.vis_dir and rank == 0:
+        os.makedirs(args.vis_dir, exist_ok=True)
+    if distributed:
+        dist.barrier()
+    if args.vis_dir:
+        import vis_mini
+        pc = cfg.point_cloud_range
+        det_bounds = (pc[0], pc[1], pc[3], pc[4])
+        z_bounds = (label_range[2], label_range[5])
+        class_names = list(cfg.class_names)
+    model.eval()
     if rank == 0:
-        if args.out:
-            print(f'\nwriting results to {args.out}')
-            assert False
-            #mmcv.dump(outputs['bbox_results'], args.out)
-        kwargs = {} if args.eval_options is None else args.eval_options
-        kwargs['jsonfile_prefix'] = osp.join('test', args.config.split(
-            '/')[-1].split('.')[-2], time.ctime().replace(' ', '_').replace(':', '_'))
-        if args.format_only:
-            dataset.format_results(outputs, **kwargs)
+        prog_bar = mmcv.ProgressBar(len(dataset))
+    for step, data in enumerate(data_loader):
+        if step >= len(indices):
+            break
+        index = indices[step]
+        if rank * len(indices) + step >= len(dataset):
+            continue
+        with torch.no_grad():
+            result = model(return_loss=False, rescale=True, **data)[0]
+        info = dataset.data_infos[index]
+        if 'det' in metrics and result.get('pts_bbox') is not None:
+            ann = dataset.get_ann_info(index)
+            pred = result['pts_bbox']
+            det_records.append(dict(
+                token=info['token'],
+                gt=pack_boxes(ann['gt_bboxes_3d'], ann['gt_labels_3d']),
+                pred=pack_boxes(pred['boxes_3d'], pred['labels_3d'], pred['scores_3d']),
+            ))
+        occ_gt = occ_mask = None
+        if show_occ and (occ_meter is not None or (args.vis_dir and index % args.vis_interval == 0)):
+            gt_path = occ_index.get(info['token'])
+            if gt_path is None:
+                raise FileNotFoundError('没有找到 {} 的占用标签'.format(info['token']))
+            occ_file = np.load(gt_path)
+            occ_gt = occ_file['semantics']
+            occ_mask = occ_file['mask_camera'].astype(bool)
+        if occ_meter is not None:
+            pred_occ = crop_occ(result['occ'], grid, label_range)
+            origin = lidar_to_ego_matrix(info)[:3, 3]
+            occ_meter.update(pred_occ, occ_gt, occ_mask, origin)
+        if args.vis_dir and index % args.vis_interval == 0:
+            gt_boxes = gt_labels = None
+            pred_boxes = pred_labels = pred_scores = None
+            if show_det:
+                ann = dataset.get_ann_info(index)
+                gt_boxes, gt_labels = ann['gt_bboxes_3d'], ann['gt_labels_3d']
+                pred_boxes, pred_labels, pred_scores = take_pred_boxes(result, args.score_thr)
+            image = vis_mini.render_frame(
+                info, lidar_to_ego_matrix(info), gt_boxes, gt_labels,
+                pred_boxes, pred_labels, pred_scores, occ_gt, result.get('occ'),
+                show_det, show_occ, det_bounds, label_range, grid, class_names, z_bounds)
+            name = '{:03d}_{}.jpg'.format(index, info['token'][:8])
+            vis_mini.cv2.imwrite(osp.join(args.vis_dir, name), image)
+        if rank == 0:
+            for _ in range(world_size):
+                prog_bar.update()
 
-        if args.eval:
-            eval_kwargs = cfg.get('evaluation', {}).copy()
-            # hard-code way to remove EvalHook args
-            for key in [
-                    'interval', 'tmpdir', 'start', 'gpu_collect', 'save_best',
-                    'rule'
-            ]:
-                eval_kwargs.pop(key, None)
-            eval_kwargs.update(dict(metric=args.eval, **kwargs))
-
-            print(dataset.evaluate(outputs, **eval_kwargs))
+    if distributed:
+        det_records = collect_results_cpu(det_records, len(dataset), args.tmpdir)
+        if occ_meter is not None:
+            reduce_occ(occ_meter)
+    if rank == 0 and args.out and det_records:
+        print('\nwriting results to {}'.format(args.out))
+        mmcv.dump(det_records, args.out)
+    if rank == 0 and 'det' in metrics:
+        _, text = evaluate_det(det_records or [], list(cfg.class_names), args.score_thr)
+        print('\n' + text)
+    if rank == 0 and occ_meter is not None:
+        _, text = occ_meter.summary()
+        print('\n' + text)
 
 
 if __name__ == '__main__':

@@ -4,9 +4,9 @@
 下面先画俯视图，再画从后上方看的 3D 透视。必须按样本顺序跑，时序记忆才和训练时一致。
 
 示例：
-python tools/vis_mini.py \\
-  projects/configs/TianLangEyes/streampetr_r50_pp_lss_nus_mini.py \\
-  work_dirs/streampetr_r50_pp_lss_nus_mini/latest.pth \\
+python tools/vis_mini.py \
+  projects/configs/TianLangEyes/streampetr_r50_pp_lss_nus_mini.py \
+  work_dirs/streampetr_r50_pp_lss_nus_mini/latest.pth \
   --out-dir work_dirs/vis_mini
 """
 import argparse
@@ -558,6 +558,57 @@ def panel(image, title):
     return np.concatenate([bar, image], axis=0)
 
 
+def render_frame(info, lidar2ego, gt_boxes, gt_labels, pred_boxes, pred_labels, pred_scores,
+                 occ_gt, occ_pred, show_det, show_occ, det_bounds, label_range, grid,
+                 class_names, z_bounds):
+    """拼一帧和 main 相同的图：环视、俯视、后上方透视。绿是真值，按类别上色的是预测。"""
+    rows = []
+    for names in CAM_LAYOUT:
+        cams = []
+        for name in names:
+            cam = info['cams'][name]
+            image = cv2.imread(cam['data_path'])
+            src_hw = image.shape[:2]
+            image = cv2.resize(image, (IMG_W, IMG_H))
+            if show_det:
+                lidar2img = scale_lidar2img(
+                    camera_ego2img(cam, lidar2ego), src_hw, (IMG_H, IMG_W))
+                draw_boxes_on_image(
+                    image, gt_boxes, gt_labels, lidar2img, class_names, color=(0, 180, 0))
+                draw_boxes_on_image(
+                    image, pred_boxes, pred_labels, lidar2img, class_names, scores=pred_scores)
+            cams.append(panel(image, name))
+        rows.append(np.concatenate(cams, axis=1))
+
+    bottom = []
+    raised = []
+    if show_det:
+        canvas = np.full((PLAN_SIZE, PLAN_SIZE, 3), 255, dtype=np.uint8)
+        pts = transform_points_lidar_to_ego(
+            np.fromfile(info['lidar_path'], dtype=np.float32).reshape(-1, 5),
+            lidar2ego)
+        draw_points(canvas, pts, det_bounds)
+        draw_boxes(canvas, gt_boxes, gt_labels, det_bounds, color=(0, 180, 0))
+        draw_boxes(canvas, pred_boxes, pred_labels, det_bounds, scores=pred_scores)
+        draw_axes(canvas, det_bounds)
+        bottom.append(panel(canvas, 'det  green=gt  color=pred'))
+        raised.append(panel(render_det_3d(
+            pts, gt_boxes, gt_labels, pred_boxes, pred_labels, pred_scores,
+            det_bounds, z_bounds), 'det 3d'))
+    if show_occ:
+        pred_crop, pred_bounds = crop_occ(occ_pred, grid, label_range)
+        gt_bounds = (label_range[0], label_range[1], label_range[3], label_range[4])
+        bottom.append(panel(colorize_occ(occ_gt, PLAN_SIZE, gt_bounds), 'occ gt'))
+        bottom.append(panel(colorize_occ(pred_crop, PLAN_SIZE, pred_bounds), 'occ pred'))
+        raised.append(panel(render_occ_3d(occ_gt, gt_bounds, z_bounds), 'occ gt 3d'))
+        raised.append(panel(render_occ_3d(pred_crop, pred_bounds, z_bounds), 'occ pred 3d'))
+    if bottom:
+        rows.append(np.concatenate(bottom, axis=1))
+    if raised:
+        rows.append(np.concatenate(raised, axis=1))
+    return stitch_rows(rows)
+
+
 def main():
     args = parse_args()
     cfg = Config.fromfile(args.config)
@@ -611,56 +662,16 @@ def main():
             pred_labels = pred['labels_3d'][keep]
             pred_scores = pred['scores_3d'][keep]
 
-        rows = []
-        for names in CAM_LAYOUT:
-            cams = []
-            for name in names:
-                cam = info['cams'][name]
-                image = cv2.imread(cam['data_path'])
-                src_hw = image.shape[:2]
-                image = cv2.resize(image, (IMG_W, IMG_H))
-                if show_det:
-                    lidar2img = scale_lidar2img(
-                        camera_ego2img(cam, lidar2ego), src_hw, (IMG_H, IMG_W))
-                    draw_boxes_on_image(
-                        image, gt_boxes, gt_labels, lidar2img, class_names, color=(0, 180, 0))
-                    draw_boxes_on_image(
-                        image, pred_boxes, pred_labels, lidar2img, class_names, scores=pred_scores)
-                cams.append(panel(image, name))
-            rows.append(np.concatenate(cams, axis=1))
-
-        bottom = []
-        raised = []
-        pts = None
-        if show_det:
-            canvas = np.full((PLAN_SIZE, PLAN_SIZE, 3), 255, dtype=np.uint8)
-            pts = transform_points_lidar_to_ego(
-                np.fromfile(info['lidar_path'], dtype=np.float32).reshape(-1, 5),
-                lidar2ego)
-            draw_points(canvas, pts, det_bounds)
-            draw_boxes(canvas, gt_boxes, gt_labels, det_bounds, color=(0, 180, 0))
-            draw_boxes(canvas, pred_boxes, pred_labels, det_bounds, scores=pred_scores)
-            draw_axes(canvas, det_bounds)
-            bottom.append(panel(canvas, 'det  green=gt  color=pred'))
-            raised.append(panel(render_det_3d(
-                pts, gt_boxes, gt_labels, pred_boxes, pred_labels, pred_scores,
-                det_bounds, z_bounds), 'det 3d'))
+        occ_gt = None
         if show_occ:
             gt_path = occ_index.get(info['token'])
             if gt_path is None:
                 raise FileNotFoundError('没有找到 {} 的占用标签'.format(info['token']))
-            gt = np.load(gt_path)['semantics']
-            pred_occ, pred_bounds = crop_occ(result['occ'], grid, label_range)
-            gt_bounds = (label_range[0], label_range[1], label_range[3], label_range[4])
-            bottom.append(panel(colorize_occ(gt, PLAN_SIZE, gt_bounds), 'occ gt'))
-            bottom.append(panel(colorize_occ(pred_occ, PLAN_SIZE, pred_bounds), 'occ pred'))
-            raised.append(panel(render_occ_3d(gt, gt_bounds, z_bounds), 'occ gt 3d'))
-            raised.append(panel(render_occ_3d(pred_occ, pred_bounds, z_bounds), 'occ pred 3d'))
-        if bottom:
-            rows.append(np.concatenate(bottom, axis=1))
-        if raised:
-            rows.append(np.concatenate(raised, axis=1))
-        image = stitch_rows(rows)
+            occ_gt = np.load(gt_path)['semantics']
+        image = render_frame(
+            info, lidar2ego, gt_boxes, gt_labels, pred_boxes, pred_labels, pred_scores,
+            occ_gt, result.get('occ'), show_det, show_occ, det_bounds, label_range, grid,
+            class_names, z_bounds)
         name = '{:03d}_{}.jpg'.format(index, info['token'][:8])
         cv2.imwrite(osp.join(args.out_dir, name), image)
         print(index, name)
