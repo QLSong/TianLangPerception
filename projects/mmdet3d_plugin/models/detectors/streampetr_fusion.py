@@ -1,7 +1,7 @@
 """相机 + 激光雷达多任务检测器。
 
 检测走 StreamPETR 时序 query，每一层图像交叉注意力后再看一次 PointPillars BEV。
-占用把 LSS BEV 和同一份雷达 BEV 相加，再过 UNet 和占用头。
+占用可以是平面投影加 UNet，OPUS 稀疏 query，或 GaussianOcc 体素。OPUS 打开雷达时，PointPillars BEV 先投到 query 通道，再按占据点采样后和图像特征拼在一起。
 `use_lidar` 关掉时，两个任务都不再读点云。
 `tasks` 取 det、occ 或 both；没打开的分支在 train() 里关掉梯度。
 图像骨干可以是可训练的 ResNet-50，或冻结的 DINOv3 ConvNeXt。
@@ -11,12 +11,15 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from mmcv.cnn import ConvModule
 from mmdet.models import DETECTORS
 from mmdet3d.models import build_backbone, build_head, build_neck
 from mmseg.models.backbones.unet import UNet  # noqa: F401
 from mmseg.models import build_backbone as build_mmseg_backbone
 
 from projects.mmdet3d_plugin.models.detectors.petr3d import Petr3D
+from projects.mmdet3d_plugin.models.gaussian_occ.head import GaussianOccHead
+from projects.mmdet3d_plugin.models.opus.opus_head import OPUSV1Head
 
 
 def parse_tasks(tasks):
@@ -33,17 +36,24 @@ def parse_tasks(tasks):
     return names
 
 
+def _is_occ_loss(key):
+    return key.startswith('occ_') or 'loss_occ' in key or 'loss_voxel_' in key
+
+
 def _keep_task_losses(losses, tasks):
     """单任务训练时丢掉另一个任务的 loss，避免被日志和总 loss 算进去。"""
     if 'det' in tasks and 'occ' in tasks:
         return losses
     det_marks = ('loss_cls', 'loss_bbox', 'loss_iou')
-    occ_marks = ('loss_occ', 'loss_voxel_')
     kept = {}
     for key, value in losses.items():
-        if 'det' not in tasks and any(mark in key for mark in det_marks):
+        if _is_occ_loss(key):
+            if 'occ' in tasks:
+                kept[key] = value
             continue
-        if 'occ' not in tasks and any(mark in key for mark in occ_marks):
+        if any(mark in key for mark in det_marks):
+            if 'det' in tasks:
+                kept[key] = value
             continue
         kept[key] = value
     return kept
@@ -191,7 +201,13 @@ class StreamPETRFusion(Petr3D):
             bev_out = bev_backbone.get('base_channels', 64)
         occ_in = occ_head.get('in_dim', 256) if occ_head else 256
         self.bev_neck = nn.Conv2d(bev_out, occ_in, kernel_size=1) if self.bev_backbone else None
-        self.occ_head = build_head(occ_head) if occ_head else None
+        self.occ_head = self._build_occ_head(occ_head) if occ_head else None
+        self.lidar_opus_proj = None
+        if (self.lidar_backbone is not None and isinstance(self.occ_head, OPUSV1Head)
+                and getattr(self.occ_head.transformer, 'with_pts', False)):
+            self.lidar_opus_proj = ConvModule(
+                lidar_bev_channels, self.occ_head.embed_dims, kernel_size=3,
+                stride=1, padding=1, bias=True, conv_cfg=dict(type='Conv2d'))
         lss_channels = img_view_transformer.get('out_channels', 64) if img_view_transformer else 64
         self.lidar_occ_fuse = None
         if self.lidar_backbone is not None and self.img_view_transformer is not None:
@@ -210,6 +226,7 @@ class StreamPETRFusion(Petr3D):
         train_occ = 'occ' in self.tasks
         _set_requires_grad(self.lidar_backbone, self.use_lidar and (train_det or train_occ))
         _set_requires_grad(self.lidar_occ_fuse, self.use_lidar and train_occ)
+        _set_requires_grad(self.lidar_opus_proj, self.use_lidar and train_occ)
         _set_requires_grad(self.pts_bbox_head, train_det)
         _freeze_det_constants(self.pts_bbox_head)
         _set_requires_grad(self.img_view_transformer, train_occ)
@@ -282,6 +299,79 @@ class StreamPETRFusion(Petr3D):
         bda = torch.eye(3, device=device).unsqueeze(0).repeat(b, 1, 1)
         return [img_feats, sensor2ego, ego2global, cam2imgs, post_rots, post_trans, bda]
 
+    def _build_occ_head(self, occ_head):
+        occ_head = occ_head.copy()
+        if occ_head.get('type') == 'OPUSV1Head':
+            if self.train_cfg is not None and self.train_cfg.get('occ') is not None:
+                occ_head['train_cfg'] = self.train_cfg.get('occ')
+            if self.test_cfg is not None and self.test_cfg.get('occ') is not None:
+                occ_head['test_cfg'] = self.test_cfg.get('occ')
+        return build_head(occ_head)
+
+    def extract_img_feat(self, img, len_queue=1, training_mode=False):
+        if not isinstance(getattr(self, 'occ_head', None), OPUSV1Head):
+            return super().extract_img_feat(img, len_queue, training_mode)
+        batch = img.size(0)
+        if img.dim() == 6:
+            img = img.flatten(1, 2)
+        if img.dim() == 5 and img.size(0) == 1:
+            img.squeeze_()
+        elif img.dim() == 5 and img.size(0) > 1:
+            _, n, c, h, w = img.size()
+            img = img.reshape(batch * n, c, h, w)
+        if self.use_grid_mask:
+            img = self.grid_mask(img)
+        img_feats = self.img_backbone(img)
+        if isinstance(img_feats, dict):
+            img_feats = list(img_feats.values())
+        if self.with_img_neck:
+            img_feats = self.img_neck(img_feats)
+        mlvl = []
+        for feat in img_feats:
+            bn, channels, height, width = feat.shape
+            mlvl.append(feat.view(batch, bn // batch, channels, height, width))
+        self._opus_mlvl = mlvl
+        level = img_feats[self.position_level]
+        bn, channels, height, width = level.shape
+        views = bn // batch // len_queue
+        if self.training or training_mode:
+            return level.view(batch, len_queue, views, channels, height, width)
+        return level.view(batch, views, channels, height, width)
+
+    def _opus_metas(self, img_metas, lidar2img):
+        if img_metas and isinstance(img_metas[0], (list, tuple)):
+            frame_metas = list(img_metas[-1])
+        else:
+            frame_metas = list(img_metas)
+        mats = lidar2img
+        if torch.is_tensor(mats):
+            if mats.dim() == 5:
+                mats = mats[:, -1]
+            mats = mats.detach().float().cpu().numpy()
+        metas = []
+        for i, meta in enumerate(frame_metas):
+            meta = dict(meta)
+            meta['ego2img'] = np.asarray(mats[i], dtype=np.float32)
+            meta['ego2occ'] = np.eye(4, dtype=np.float32)
+            meta['ego2lidar'] = np.eye(4, dtype=np.float32)
+            metas.append(meta)
+        return metas
+
+    def _opus_dense(self, result):
+        shape = tuple(int(v) for v in self.occ_head.voxel_num.tolist())
+        occ = np.full(shape, int(self.occ_head.empty_label), dtype=np.uint8)
+        loc = result['occ_loc']
+        if len(loc):
+            occ[loc[:, 0], loc[:, 1], loc[:, 2]] = result['sem_pred']
+        return occ
+
+    def _opus_pts(self, lidar_bev):
+        if self.lidar_opus_proj is None:
+            return None
+        if lidar_bev is None:
+            raise RuntimeError('OPUS lidar sampling is on but the batch has no lidar BEV')
+        return self.lidar_opus_proj(lidar_bev)
+
     def forward_occ(self, img_feats, data, lidar_bev=None):
         if self.img_view_transformer is None:
             return None
@@ -330,8 +420,22 @@ class StreamPETRFusion(Petr3D):
         if train_occ:
             if voxel_semantics is None:
                 raise RuntimeError('task includes occ but the batch has no voxel_semantics')
-            occ = self.forward_occ(data['img_feats'][:, -1], data, lidar_bev)
-            losses.update(self.occ_head.loss(occ, voxel_semantics, mask_camera))
+            if isinstance(self.occ_head, OPUSV1Head):
+                if mask_camera is None:
+                    mask_camera = torch.ones_like(voxel_semantics)
+                preds = self.occ_head(
+                    self._opus_mlvl, self._opus_metas(img_metas, data['lidar2img']),
+                    self._opus_pts(lidar_bev))
+                for key, value in self.occ_head.loss(voxel_semantics, mask_camera, preds).items():
+                    losses['occ_' + key] = value
+            elif isinstance(self.occ_head, GaussianOccHead):
+                occ = self.occ_head(
+                    data['img_feats'], data['extrinsics'], data['intrinsics'],
+                    (data['img'].shape[-2], data['img'].shape[-1]))
+                losses.update(self.occ_head.loss(occ, voxel_semantics, mask_camera))
+            else:
+                occ = self.forward_occ(data['img_feats'][:, -1], data, lidar_bev)
+                losses.update(self.occ_head.loss(occ, voxel_semantics, mask_camera))
         return _keep_task_losses(losses, self.tasks)
 
     def _points_for_test(self, points):
@@ -352,10 +456,21 @@ class StreamPETRFusion(Petr3D):
             for result_dict, pts_bbox in zip(bbox_list, self.simple_test_pts(img_metas, **data)):
                 result_dict['pts_bbox'] = pts_bbox
         if 'occ' in self.tasks:
-            feats = data['img_feats']
-            if feats.dim() == 6:
-                feats = feats[:, -1]
-            occ = self.forward_occ(feats, data, lidar_bev)
-            for result_dict, occ_pred in zip(bbox_list, self.occ_head.get_occ(occ, img_metas)):
+            if isinstance(self.occ_head, OPUSV1Head):
+                metas = self._opus_metas(img_metas, data['lidar2img'])
+                preds = self.occ_head(self._opus_mlvl, metas, self._opus_pts(lidar_bev))
+                occ_preds = [self._opus_dense(item) for item in self.occ_head.get_occ(preds, metas)]
+            elif isinstance(self.occ_head, GaussianOccHead):
+                occ = self.occ_head(
+                    data['img_feats'], data['extrinsics'], data['intrinsics'],
+                    (data['img'].shape[-2], data['img'].shape[-1]))
+                occ_preds = self.occ_head.get_occ(occ, img_metas)
+            else:
+                feats = data['img_feats']
+                if feats.dim() == 6:
+                    feats = feats[:, -1]
+                occ = self.forward_occ(feats, data, lidar_bev)
+                occ_preds = self.occ_head.get_occ(occ, img_metas)
+            for result_dict, occ_pred in zip(bbox_list, occ_preds):
                 result_dict['occ'] = occ_pred
         return bbox_list

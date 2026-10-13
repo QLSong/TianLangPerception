@@ -9,11 +9,14 @@ plugin = True
 plugin_dir = 'projects/mmdet3d_plugin/'
 # DINOv3 ConvNeXt-Tiny, backbone weights frozen.
 # task: 'det' | 'occ' | 'both'
-task = 'both'
+task = 'det'
 # 图像交叉注意力。False 用原来的全连接注意力，True 用可变形注意力。
 use_img_deform_attn = True
 # 关掉后检测和占用都不再读点云。打开时两个任务共用 PointPillars BEV。
 use_lidar = True
+# 检测跨帧 memory。False 时 query 只看当前帧，不传播历史框，也不写 memory。
+# True 时第一层只用当前帧，refine 后用历史框换掉低分 query，之后每层把预测中心写回采样点。
+use_det_temporal = True
 data_root = './data/nuscenes/'
 occ_root = data_root + 'gts/'
 
@@ -37,7 +40,7 @@ class_names = [
 ]
 num_gpus = 1
 batch_size = 4
-num_iters_per_epoch = 28130 // (num_gpus * batch_size)
+num_iters_per_epoch = 50000 // (num_gpus * batch_size)
 num_epochs = 24
 queue_length = 1
 num_frame_losses = 1
@@ -71,30 +74,30 @@ model = dict(
         pretrained='ckpts/dinov3_convnext_tiny_lvd1689m.safetensors'),
     img_neck=dict(type='CPFPN', in_channels=[384, 768], out_channels=256, num_outs=2),
     pts_backbone=dict(type='PointPillars', ny=_pillar_ny, nx=_pillar_nx),
-    img_view_transformer=dict(
-        type='LSSViewTransformer',
-        grid_config=dict(
-            x=[lidar_pc_range[0], lidar_pc_range[3], _bev_step],
-            y=[lidar_pc_range[1], lidar_pc_range[4], _bev_step],
-            z=[-1.0, 5.4, 6.4],
-            depth=[1.0, 45.0, 0.5]),
-        input_size=(256, 704),
-        in_channels=256,
-        out_channels=64,
-        sid=False,
-        collapse_z=True,
-        downsample=16),
-    # 按高度平面投影再聚合。启用时注释掉上面的 LSSViewTransformer。
     # img_view_transformer=dict(
-    #     type='PlaneViewTransformer',
+    #     type='LSSViewTransformer',
     #     grid_config=dict(
     #         x=[lidar_pc_range[0], lidar_pc_range[3], _bev_step],
-    #         y=[lidar_pc_range[1], lidar_pc_range[4], _bev_step]),
+    #         y=[lidar_pc_range[1], lidar_pc_range[4], _bev_step],
+    #         z=[-1.0, 5.4, 6.4],
+    #         depth=[1.0, 45.0, 0.5]),
     #     input_size=(256, 704),
     #     in_channels=256,
     #     out_channels=64,
-    #     downsample=16,
-    #     bev_planes=(-1.0, 0.0, 1.0, 2.0)),
+    #     sid=False,
+    #     collapse_z=True,
+    #     downsample=16),
+    # 按高度平面投影再聚合。启用时注释掉上面的 LSSViewTransformer。
+    img_view_transformer=dict(
+        type='PlaneViewTransformer',
+        grid_config=dict(
+            x=[lidar_pc_range[0], lidar_pc_range[3], _bev_step],
+            y=[lidar_pc_range[1], lidar_pc_range[4], _bev_step]),
+        input_size=(256, 704),
+        in_channels=256,
+        out_channels=64,
+        downsample=16,
+        bev_planes=(-1.0, 0.0, 1.0, 2.0)),
     bev_backbone=dict(
         type='UNet',
         in_channels=64,
@@ -131,6 +134,7 @@ model = dict(
         memory_len=1024,
         topk_proposals=128,
         num_propagated=128,
+        use_temporal=use_det_temporal,
         with_ego_pos=True,
         match_with_velo=False,
         scalar=10,
@@ -268,7 +272,7 @@ optimizer_config = dict(
     grad_clip=dict(max_norm=35, norm_type=2))
 lr_config = dict(
     policy='CosineAnnealing', warmup='linear', warmup_iters=500,
-    warmup_ratio=1.0 / 3, min_lr_ratio=1e-3)
+    warmup_ratio=1.0 / 3, min_lr_ratio=2e-4)
 _eval_interval = num_iters_per_epoch * num_epochs if task != 'occ' else num_iters_per_epoch * num_epochs + 1
 evaluation = dict(interval=_eval_interval, pipeline=test_pipeline)
 find_unused_parameters = True

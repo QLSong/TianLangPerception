@@ -73,6 +73,7 @@ class StreamPETRHead(AnchorFreeHead):
                  num_propagated=256,
                  with_dn=True,
                  with_ego_pos=True,
+                 use_temporal=True,
                  match_with_velo=True,
                  match_costs=None,
                  transformer=None,
@@ -167,6 +168,7 @@ class StreamPETRHead(AnchorFreeHead):
         self.num_propagated = num_propagated
         self.with_dn = with_dn
         self.with_ego_pos = with_ego_pos
+        self.use_temporal = use_temporal
         self.match_with_velo = match_with_velo
         self.num_reg_fcs = num_reg_fcs
         self.train_cfg = train_cfg
@@ -319,6 +321,8 @@ class StreamPETRHead(AnchorFreeHead):
         self.memory_velo = None
 
     def pre_update_memory(self, data):
+        if not self.use_temporal:
+            return
         x = data['prev_exists']
         B = x.size(0)
         # refresh the memory when the scene changes
@@ -345,6 +349,8 @@ class StreamPETRHead(AnchorFreeHead):
             self.memory_egopose[:, :self.num_propagated]  = self.memory_egopose[:, :self.num_propagated] + (1 - x).view(B, 1, 1, 1) * torch.eye(4, device=x.device)
 
     def post_update_memory(self, data, rec_ego_pose, all_cls_scores, all_bbox_preds, outs_dec, mask_dict):
+        if not self.use_temporal:
+            return
         if self.training and mask_dict and mask_dict['pad_size'] > 0:
             rec_reference_points = all_bbox_preds[:, :, mask_dict['pad_size']:, :3][-1]
             rec_velo = all_bbox_preds[:, :, mask_dict['pad_size']:, -2:][-1]
@@ -427,12 +433,22 @@ class StreamPETRHead(AnchorFreeHead):
 
     def temporal_alignment(self, query_pos, tgt, reference_points):
         B = query_pos.size(0)
+        if not self.use_temporal:
+            rec_ego_pose = torch.eye(4, device=query_pos.device).unsqueeze(0).unsqueeze(0).repeat(B, query_pos.size(1), 1, 1)
+            if self.with_ego_pos:
+                rec_ego_motion = torch.cat([torch.zeros_like(reference_points[..., :3]), rec_ego_pose[..., :3, :].flatten(-2)], dim=-1)
+                rec_ego_motion = nerf_positional_encoding(rec_ego_motion)
+                tgt = self.ego_pose_memory(tgt, rec_ego_motion)
+                query_pos = self.ego_pose_pe(query_pos, rec_ego_motion)
+            query_pos += self.time_embedding(pos2posemb1d(torch.zeros_like(reference_points[..., :1])))
+            return tgt, query_pos, reference_points, None, None, rec_ego_pose
 
         temp_reference_point = (self.memory_reference_point - self.pc_range[:3]) / (self.pc_range[3:6] - self.pc_range[0:3])
         temp_pos = self.query_embedding(pos2posemb3d(temp_reference_point)) 
         temp_memory = self.memory_embedding
         rec_ego_pose = torch.eye(4, device=query_pos.device).unsqueeze(0).unsqueeze(0).repeat(B, query_pos.size(1), 1, 1)
-        
+        memory_ego_motion = None
+
         if self.with_ego_pos:
             rec_ego_motion = torch.cat([torch.zeros_like(reference_points[...,:3]), rec_ego_pose[..., :3, :].flatten(-2)], dim=-1)
             rec_ego_motion = nerf_positional_encoding(rec_ego_motion)
@@ -445,6 +461,12 @@ class StreamPETRHead(AnchorFreeHead):
 
         query_pos += self.time_embedding(pos2posemb1d(torch.zeros_like(reference_points[...,:1])))
         temp_pos += self.time_embedding(pos2posemb1d(self.memory_timestamp).float())
+
+        if getattr(self, 'defer_temporal', False):
+            # 第一层解码后再把历史框换进去，这里先不拼到 query 上。
+            self._deferred_reference = temp_reference_point
+            self._deferred_ego_motion = memory_ego_motion
+            return tgt, query_pos, reference_points, temp_memory, temp_pos, rec_ego_pose
 
         if self.num_propagated > 0:
             tgt = torch.cat([tgt, temp_memory[:, :self.num_propagated]], dim=1)
@@ -516,13 +538,14 @@ class StreamPETRHead(AnchorFreeHead):
                     attn_mask[single_pad * i:single_pad * (i + 1), single_pad * (i + 1):pad_size] = True
                     attn_mask[single_pad * i:single_pad * (i + 1), :single_pad * i] = True
              
-            # update dn mask for temporal modeling
-            query_size = pad_size + self.num_query + self.num_propagated
-            tgt_size = pad_size + self.num_query + self.memory_len
-            temporal_attn_mask = torch.ones(query_size, tgt_size).to(reference_points.device) < 0
-            temporal_attn_mask[:attn_mask.size(0), :attn_mask.size(1)] = attn_mask 
-            temporal_attn_mask[pad_size:, :pad_size] = True
-            attn_mask = temporal_attn_mask
+            if self.use_temporal and not getattr(self, 'defer_temporal', False):
+                # update dn mask for temporal modeling
+                query_size = pad_size + self.num_query + self.num_propagated
+                tgt_size = pad_size + self.num_query + self.memory_len
+                temporal_attn_mask = torch.ones(query_size, tgt_size).to(reference_points.device) < 0
+                temporal_attn_mask[:attn_mask.size(0), :attn_mask.size(1)] = attn_mask
+                temporal_attn_mask[pad_size:, :pad_size] = True
+                attn_mask = temporal_attn_mask
 
             mask_dict = {
                 'known_indice': torch.as_tensor(known_indice).long(),

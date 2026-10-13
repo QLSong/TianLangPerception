@@ -1,7 +1,7 @@
 """在小训练集上按时间顺序自测，并把预测和真值画到同一张图。
 
-六路相机按环视排列，3D 框投到每一路图像上：绿是真值，按类别上色的是预测。
-下面先画俯视图，再画从后上方看的 3D 透视。必须按样本顺序跑，时序记忆才和训练时一致。
+六路相机按环视排列。检测和占用各画一套：检测只在原图上投预测框，占用按立方体投在空白底上。
+俯视图和后上方透视里，绿是真值，按类别上色的是预测。必须按样本顺序跑，时序记忆才和训练时一致。
 
 示例：
 python tools/vis_mini.py \
@@ -252,6 +252,147 @@ def draw_boxes_on_image(image, boxes, labels, lidar2img, class_names, color=None
         cv2.putText(
             image, '{} {:.2f}'.format(name, float(scores[i])),
             anchor, cv2.FONT_HERSHEY_SIMPLEX, 0.45, shade, 1, cv2.LINE_AA)
+
+
+# 立方体外表面：法向符号，以及相对体素中心的四个角。
+_CUBE_FACES = (
+    (0, -1, ((-1, -1, -1), (-1, 1, -1), (-1, 1, 1), (-1, -1, 1))),
+    (0, 1, ((1, -1, -1), (1, -1, 1), (1, 1, 1), (1, 1, -1))),
+    (1, -1, ((-1, -1, -1), (-1, -1, 1), (1, -1, 1), (1, -1, -1))),
+    (1, 1, ((-1, 1, -1), (1, 1, -1), (1, 1, 1), (-1, 1, 1))),
+    (2, -1, ((-1, -1, -1), (1, -1, -1), (1, 1, -1), (-1, 1, -1))),
+    (2, 1, ((-1, -1, 1), (-1, 1, 1), (1, 1, 1), (1, -1, 1))),
+)
+
+
+def _camera_center(ego2img):
+    projection = np.asarray(ego2img, dtype=np.float64)[:3]
+    _, _, vt = np.linalg.svd(projection)
+    center = vt[-1]
+    return center[:3] / center[3]
+
+
+def _clip_poly_near(pts, near=0.2):
+    """在相机深度上裁掉近平面后面的顶点。pts 是投影前的 (u*z, v*z, z)。"""
+    out = []
+    count = len(pts)
+    for i in range(count):
+        cur = pts[i]
+        nxt = pts[(i + 1) % count]
+        cur_in = cur[2] > near
+        nxt_in = nxt[2] > near
+        if cur_in and nxt_in:
+            out.append(nxt)
+        elif cur_in != nxt_in:
+            t = (near - cur[2]) / (nxt[2] - cur[2])
+            hit = cur + t * (nxt - cur)
+            out.append(hit)
+            if nxt_in:
+                out.append(nxt)
+    if len(out) < 3:
+        return None
+    out = np.stack(out, axis=0)
+    uv = out[:, :2] / out[:, 2:3]
+    if not np.isfinite(uv).all():
+        return None
+    return uv
+
+
+def draw_occ_on_image(image, occ, xy_bounds, z_bounds, ego2img, alpha=1.0):
+    """把占用体素画成立方体投回图像。只画朝向相机的外表面，近处挡住远处。"""
+    occ = np.asarray(occ)
+    if occ.ndim != 3 or occ.size == 0:
+        return
+    x0, y0, x1, y1 = [float(v) for v in xy_bounds]
+    z0, z1 = [float(v) for v in z_bounds]
+    nx, ny, nz = occ.shape
+    dx = (x1 - x0) / nx
+    dy = (y1 - y0) / ny
+    dz = (z1 - z0) / max(nz, 1)
+    known = (occ != EMPTY) & (occ < len(OCC_COLORS))
+    if not np.any(known):
+        return
+    padded = np.pad(known, 1, constant_values=False)
+    neighbor = (
+        padded[:-2, 1:-1, 1:-1], padded[2:, 1:-1, 1:-1],
+        padded[1:-1, :-2, 1:-1], padded[1:-1, 2:, 1:-1],
+        padded[1:-1, 1:-1, :-2], padded[1:-1, 1:-1, 2:],
+    )
+    cam_pos = _camera_center(ego2img)
+    mat = np.asarray(ego2img, dtype=np.float64).T
+    half = np.array([dx, dy, dz], dtype=np.float64) * 0.5
+    h, w = image.shape[:2]
+    polys = []
+    depths = []
+    colors = []
+    for face_i, (axis, sign, corners) in enumerate(_CUBE_FACES):
+        mask = known & ~neighbor[face_i]
+        xs, ys, zs = np.nonzero(mask)
+        if xs.size == 0:
+            continue
+        center = np.stack([
+            x0 + (xs.astype(np.float64) + 0.5) * dx,
+            y0 + (ys.astype(np.float64) + 0.5) * dy,
+            z0 + (zs.astype(np.float64) + 0.5) * dz,
+        ], axis=1)
+        see = (cam_pos[axis] - center[:, axis]) * sign > 0
+        if not np.any(see):
+            continue
+        center = center[see]
+        labels = occ[xs[see], ys[see], zs[see]]
+        view = cam_pos - center
+        view_norm = np.linalg.norm(view, axis=1).clip(min=1e-6)
+        shade = 0.45 + 0.55 * np.clip(view[:, axis] * sign / view_norm, 0.0, 1.0)
+        color = OCC_COLORS[labels][:, ::-1].astype(np.float32) * shade[:, None]
+        corner = np.stack([
+            center + np.array(offset, dtype=np.float64) * half for offset in corners
+        ], axis=1)
+        hom = np.concatenate([
+            corner, np.ones(corner.shape[:2] + (1,), dtype=np.float64)], axis=-1)
+        cam = (hom.reshape(-1, 4) @ mat).reshape(-1, 4, 4)[..., :3]
+        depth = cam[..., 2]
+        keep = np.isfinite(depth).all(axis=1) & (depth.max(axis=1) > 0.2)
+        if not np.any(keep):
+            continue
+        cam = cam[keep]
+        depth = depth[keep]
+        color = color[keep]
+        front = depth.min(axis=1) > 0.2
+        for i in np.flatnonzero(front):
+            uv = cam[i, :, :2] / depth[i, :, None]
+            if (uv[:, 0].max() < 0 or uv[:, 1].max() < 0
+                    or uv[:, 0].min() >= w or uv[:, 1].min() >= h):
+                continue
+            polys.append(np.round(uv).astype(np.int32))
+            depths.append(float(depth[i].mean()))
+            colors.append(color[i])
+        for i in np.flatnonzero(~front):
+            uv = _clip_poly_near(cam[i])
+            if uv is None:
+                continue
+            if (uv[:, 0].max() < 0 or uv[:, 1].max() < 0
+                    or uv[:, 0].min() >= w or uv[:, 1].min() >= h):
+                continue
+            polys.append(np.round(uv).astype(np.int32))
+            depths.append(float(np.clip(cam[i, :, 2], 0.2, None).mean()))
+            colors.append(color[i])
+    if not polys:
+        return
+    order = np.argsort(-np.asarray(depths))
+    if alpha >= 1.0:
+        for i in order:
+            cv2.fillConvexPoly(image, polys[i], colors[i].tolist(), cv2.LINE_AA)
+        return
+    overlay = image.copy()
+    for i in order:
+        cv2.fillConvexPoly(overlay, polys[i], colors[i].tolist(), cv2.LINE_AA)
+    painted = np.zeros(image.shape[:2], np.uint8)
+    for i in order:
+        cv2.fillConvexPoly(painted, polys[i], 255, cv2.LINE_AA)
+    hit = painted > 0
+    base = image[hit].astype(np.float32)
+    over = overlay[hit].astype(np.float32)
+    image[hit] = (over * alpha + base * (1.0 - alpha)).astype(np.uint8)
 
 
 def stitch_rows(rows):
@@ -558,27 +699,47 @@ def panel(image, title):
     return np.concatenate([bar, image], axis=0)
 
 
-def render_frame(info, lidar2ego, gt_boxes, gt_labels, pred_boxes, pred_labels, pred_scores,
-                 occ_gt, occ_pred, show_det, show_occ, det_bounds, label_range, grid,
-                 class_names, z_bounds):
-    """拼一帧和 main 相同的图：环视、俯视、后上方透视。绿是真值，按类别上色的是预测。"""
+def _camera_views(info, lidar2ego, paint, title_suffix=''):
     rows = []
     for names in CAM_LAYOUT:
         cams = []
         for name in names:
             cam = info['cams'][name]
-            image = cv2.imread(cam['data_path'])
-            src_hw = image.shape[:2]
-            image = cv2.resize(image, (IMG_W, IMG_H))
-            if show_det:
-                lidar2img = scale_lidar2img(
-                    camera_ego2img(cam, lidar2ego), src_hw, (IMG_H, IMG_W))
-                draw_boxes_on_image(
-                    image, gt_boxes, gt_labels, lidar2img, class_names, color=(0, 180, 0))
-                draw_boxes_on_image(
-                    image, pred_boxes, pred_labels, lidar2img, class_names, scores=pred_scores)
-            cams.append(panel(image, name))
+            raw = cv2.imread(cam['data_path'])
+            src_hw = raw.shape[:2]
+            lidar2img = scale_lidar2img(
+                camera_ego2img(cam, lidar2ego), src_hw, (IMG_H, IMG_W))
+            image = paint(raw, lidar2img)
+            cams.append(panel(image, name + title_suffix))
         rows.append(np.concatenate(cams, axis=1))
+    return rows
+
+
+def render_frame(info, lidar2ego, gt_boxes, gt_labels, pred_boxes, pred_labels, pred_scores,
+                 occ_gt, occ_pred, show_det, show_occ, det_bounds, label_range, grid,
+                 class_names, z_bounds):
+    """拼一帧：检测环视、占用环视、俯视、后上方透视。俯视里绿是真值。"""
+    pred_crop = None
+    pred_bounds = None
+    if show_occ and occ_pred is not None:
+        pred_crop, pred_bounds = crop_occ(occ_pred, grid, label_range)
+    rows = []
+    if show_det:
+        def paint_det(raw, lidar2img):
+            image = cv2.resize(raw, (IMG_W, IMG_H))
+            draw_boxes_on_image(
+                image, pred_boxes, pred_labels, lidar2img, class_names, scores=pred_scores)
+            return image
+
+        rows.extend(_camera_views(info, lidar2ego, paint_det))
+    if pred_crop is not None:
+        def paint_occ(raw, lidar2img):
+            image = np.full((IMG_H, IMG_W, 3), 255, dtype=np.uint8)
+            draw_occ_on_image(
+                image, pred_crop, pred_bounds, z_bounds, lidar2img, alpha=1.0)
+            return image
+
+        rows.extend(_camera_views(info, lidar2ego, paint_occ, ' occ'))
 
     bottom = []
     raised = []
@@ -595,8 +756,7 @@ def render_frame(info, lidar2ego, gt_boxes, gt_labels, pred_boxes, pred_labels, 
         raised.append(panel(render_det_3d(
             pts, gt_boxes, gt_labels, pred_boxes, pred_labels, pred_scores,
             det_bounds, z_bounds), 'det 3d'))
-    if show_occ:
-        pred_crop, pred_bounds = crop_occ(occ_pred, grid, label_range)
+    if show_occ and pred_crop is not None:
         gt_bounds = (label_range[0], label_range[1], label_range[3], label_range[4])
         bottom.append(panel(colorize_occ(occ_gt, PLAN_SIZE, gt_bounds), 'occ gt'))
         bottom.append(panel(colorize_occ(pred_crop, PLAN_SIZE, pred_bounds), 'occ pred'))

@@ -266,6 +266,16 @@ class CustomNuScenesDataset(NuScenesDataset):
                 continue
             return data
 
+    def format_results(self, results, jsonfile_prefix=None):
+        """检测和占用写在同一个结果 dict 里。父类会遍历每个键，占用数组会被当成检测框索引。"""
+        if results and isinstance(results[0], dict):
+            det_keys = [key for key in ('pts_bbox', 'img_bbox') if key in results[0]]
+            if det_keys:
+                results = [
+                    {key: sample[key] for key in det_keys if key in sample}
+                    for sample in results]
+        return super().format_results(results, jsonfile_prefix)
+
 def lidar_to_ego_matrix(info):
     """LIDAR_TOP 到自车。nuScenes 上这是绕 z 轴约 -90°，激光雷达 +y 才是车头。"""
     rotation = Quaternion(info['lidar2ego_rotation']).rotation_matrix
