@@ -2,3 +2,4 @@ data/*
 ckpts/*
 *__pycache__*
 work_dirs/*
+*.json

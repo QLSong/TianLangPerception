@@ -7,11 +7,11 @@ _base_ = ['./streampetr_convnext_pp_lss_nus.py']
 
 opus_pc_range = [-40.0, -40.0, -1.0, 40.0, 40.0, 5.4]
 opus_voxel_size = [0.4, 0.4, 0.4]
-opus_num_layers = 6
+opus_num_layers = 3
 opus_num_levels = 2
 opus_num_query = 600
 opus_num_points = 4
-opus_num_refines = [1, 4, 16, 32, 64, 128]
+opus_num_refines = [1, 8, 64]
 opus_pts_range = [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
 
 model = dict(

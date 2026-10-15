@@ -151,9 +151,9 @@ def main():
     if args.resume_from is not None and osp.isfile(args.resume_from):
         cfg.resume_from = args.resume_from
     if args.load_from is not None:
-        if not osp.isfile(args.load_from):
-            raise FileNotFoundError(f'预训练权重不存在: {args.load_from}')
         cfg.load_from = args.load_from
+    if cfg.get('load_from') and not osp.isfile(cfg.load_from):
+        raise FileNotFoundError(f'预训练权重不存在: {cfg.load_from}')
     if args.gpu_ids is not None:
         cfg.gpu_ids = args.gpu_ids
     else:

@@ -1,11 +1,13 @@
 import os
 import os.path as osp
+import pickle
 from concurrent.futures import ThreadPoolExecutor
 
 import mmcv
 import numpy as np
 from mmdet.datasets.builder import PIPELINES
 from mmdet3d.core.points import get_points_type
+from nuscenes.eval.common.utils import Quaternion
 
 from projects.mmdet3d_plugin.datasets.nuscenes_dataset import transform_points_lidar_to_ego
 
@@ -112,4 +114,157 @@ class LoadMultiViewImageAndPoints:
             points_class = get_points_type(self.coord_type)
             results['points'] = points_class(
                 points, points_dim=points.shape[-1], attribute_dims=None)
+        return results
+
+
+# 伪标签通道到 Occ3D 类别。和 GaussianOcc nusc_dataset.semantic_map 一致。
+_SEMANTIC_MAP = np.array([
+    0, 4, 11, 3, 10, 14, 16, 13, 2, 1, 7, 15, 6, 5, 9, 8, 17,
+], dtype=np.int64)
+_CAM_CHAIN = {}
+
+
+def _pose_matrix(translation, rotation):
+    rot = Quaternion(np.asarray(rotation)).rotation_matrix.astype(np.float32)
+    mat = np.eye(4, dtype=np.float32)
+    mat[:3, :3] = rot
+    mat[:3, 3] = np.asarray(translation, dtype=np.float32)
+    return mat
+
+
+def _chain_cache_candidates(data_root):
+    return [
+        osp.join('work_dirs', 'gaussianocc_cam_chain.pkl'),
+        osp.join(data_root, 'gaussianocc_cam_chain.pkl'),
+    ]
+
+
+def _load_chain_cache(data_root):
+    for path in _chain_cache_candidates(data_root):
+        if osp.isfile(path):
+            with open(path, 'rb') as handle:
+                return pickle.load(handle)
+    return None
+
+
+def _save_chain_cache(chain, data_root):
+    for path in _chain_cache_candidates(data_root):
+        try:
+            os.makedirs(osp.dirname(path) or '.', exist_ok=True)
+            with open(path, 'wb') as handle:
+                pickle.dump(chain, handle, protocol=4)
+            return
+        except OSError:
+            continue
+
+
+def _cam_chain(data_root):
+    """sample_data token -> 文件名、前后 token、ego2global、cam2ego。第一次会扫 nuScenes 表。"""
+    cached = _CAM_CHAIN.get(data_root)
+    if cached is not None:
+        return cached
+    chain = _load_chain_cache(data_root)
+    if chain is not None:
+        _CAM_CHAIN[data_root] = chain
+        return chain
+    import json
+    table = osp.join(data_root, 'v1.0-trainval')
+    with open(osp.join(table, 'ego_pose.json'), 'r') as handle:
+        ego_rows = json.load(handle)
+    ego = {row['token']: (row['translation'], row['rotation']) for row in ego_rows}
+    del ego_rows
+    with open(osp.join(table, 'calibrated_sensor.json'), 'r') as handle:
+        calib_rows = json.load(handle)
+    calib = {row['token']: (row['translation'], row['rotation']) for row in calib_rows}
+    del calib_rows
+    with open(osp.join(table, 'sample_data.json'), 'r') as handle:
+        sample_rows = json.load(handle)
+    chain = {}
+    for row in sample_rows:
+        if 'CAM' not in row['filename']:
+            continue
+        chain[row['token']] = (
+            row['filename'],
+            row['prev'] or '',
+            row['next'] or '',
+            _pose_matrix(*ego[row['ego_pose_token']]),
+            _pose_matrix(*calib[row['calibrated_sensor_token']]))
+    del sample_rows, ego, calib
+    _save_chain_cache(chain, data_root)
+    _CAM_CHAIN[data_root] = chain
+    return chain
+
+
+def _semantic_file(data_root, img_path):
+    name = osp.basename(img_path)
+    cam = osp.basename(osp.dirname(img_path))
+    split = osp.basename(osp.dirname(osp.dirname(img_path)))
+    return osp.join(data_root, 'nuscenes_semantic', split, cam, name[:-4] + '_mask.bin')
+
+
+def _load_semantic(path):
+    label = np.fromfile(path, dtype=np.int8)
+    if label.size != 900 * 1600:
+        raise RuntimeError('语义标签 {} 的长度是 {}，不是 900×1600'.format(path, label.size))
+    return _SEMANTIC_MAP[label.astype(np.int64)].reshape(900, 1600)
+
+
+def _as_uint8(image):
+    image = np.asarray(image)
+    if image.dtype == np.uint8:
+        return image
+    return np.clip(image, 0, 255).astype(np.uint8)
+
+
+def _cam0_to_cami(cam0_to_ego, ego0_to_global, neighbor):
+    ego_i = neighbor[3]
+    cam_i = neighbor[4]
+    ego_i_to_cam = np.linalg.inv(cam_i)
+    global_to_ego_i = np.linalg.inv(ego_i)
+    return (ego_i_to_cam @ global_to_ego_i @ ego0_to_global @ cam0_to_ego).astype(np.float32)
+
+
+@PIPELINES.register_module()
+class LoadGaussianOccSupervise:
+    """读 nusc-sem-gs 的监督：当前帧二维语义，以及每个相机 12Hz 的前一帧和后一帧。"""
+
+    def __init__(self, data_root):
+        self.data_root = data_root
+
+    def __call__(self, results):
+        chain = _cam_chain(self.data_root)
+        images_m1 = []
+        images_p1 = []
+        semantics = []
+        pose_m1 = []
+        pose_p1 = []
+        for index, token in enumerate(results['cam_sd_token']):
+            img_path = results['img_filename'][index]
+            sem_path = _semantic_file(self.data_root, img_path)
+            if not osp.isfile(sem_path):
+                raise FileNotFoundError('没有找到二维语义 {}'.format(sem_path))
+            semantics.append(_load_semantic(sem_path))
+            cur = _as_uint8(results['img'][index])
+            cur_ego = np.asarray(results['cam_ego2global'][index], dtype=np.float32)
+            cur_cam = np.asarray(results['cam_to_ego'][index], dtype=np.float32)
+            record = chain.get(token)
+            if record is None:
+                raise KeyError('相机 sample_data {} 不在索引里'.format(token))
+            for slot, images, poses in ((1, images_m1, pose_m1), (2, images_p1, pose_p1)):
+                other = record[slot]
+                neighbor = chain.get(other) if other else None
+                if neighbor is None:
+                    images.append(cur)
+                    poses.append(np.eye(4, dtype=np.float32))
+                    continue
+                path = osp.join(self.data_root, neighbor[0])
+                if not osp.isfile(path):
+                    raise FileNotFoundError('没有找到相邻帧 {}'.format(path))
+                images.append(mmcv.imread(path, 'unchanged'))
+                poses.append(_cam0_to_cami(cur_cam, cur_ego, neighbor))
+        results['gs_m1_img'] = images_m1
+        results['gs_p1_img'] = images_p1
+        results['gs_semantic_full'] = semantics
+        results['gs_cam_T_m1'] = np.stack(pose_m1, axis=0)
+        results['gs_cam_T_p1'] = np.stack(pose_p1, axis=0)
         return results

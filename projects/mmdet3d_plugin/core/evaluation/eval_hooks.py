@@ -51,6 +51,22 @@ class CustomDistEvalHook(BaseDistEvalHook):
         self._decide_interval(runner)
         super().before_train_iter(runner)
 
+    def after_train_iter(self, runner):
+        """先把训练日志打出去，再评测。评测 buffer 里补上 data_time，避免文本日志 KeyError。"""
+        if self.by_epoch or not self._should_evaluate(runner):
+            return
+        from mmcv.runner.hooks.logger import LoggerHook
+        for hook in runner._hooks:
+            if isinstance(hook, LoggerHook):
+                hook.after_train_iter(runner)
+        runner.log_buffer.clear()
+        self._do_evaluate(runner)
+        output = runner.log_buffer.output
+        if 'time' not in output:
+            output['time'] = 0.0
+        if 'data_time' not in output:
+            output['data_time'] = 0.0
+
     def _do_evaluate(self, runner):
         """perform evaluation and save ckpt."""
         # Synchronization of BatchNorm's buffer (running_mean

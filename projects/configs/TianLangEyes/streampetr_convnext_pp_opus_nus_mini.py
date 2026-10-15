@@ -7,6 +7,6 @@ data = dict(
         ann_file='./data/nuscenes/nuscenes2d_temporal_infos_train_mini.pkl',
         seq_split_num=4),
 )
-runner = dict(type='IterBasedRunner', max_iters=2000)
+runner = dict(type='IterBasedRunner', max_iters=4000)
 evaluation = dict(interval=100000)
 checkpoint_config = dict(interval=500)

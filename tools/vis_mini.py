@@ -1,6 +1,6 @@
 """在小训练集上按时间顺序自测，并把预测和真值画到同一张图。
 
-六路相机按环视排列。检测和占用各画一套：检测只在原图上投预测框，占用按立方体投在空白底上。
+六路相机按环视排列。最上面是原图，有检测结果时把预测框画在原图上。占用单独投在白底上，不叠原图。
 俯视图和后上方透视里，绿是真值，按类别上色的是预测。必须按样本顺序跑，时序记忆才和训练时一致。
 
 示例：
@@ -23,7 +23,7 @@ import numpy as np
 import torch
 from mmcv import Config
 from mmcv.parallel import MMDataParallel
-from mmcv.runner import load_checkpoint
+from projects.mmdet3d_plugin.core.checkpoint import load_pretrained
 from mmdet3d.datasets import build_dataset
 from mmdet3d.models import build_model
 
@@ -31,6 +31,7 @@ from projects.mmdet3d_plugin.datasets.builder import build_dataloader
 from projects.mmdet3d_plugin.datasets.nuscenes_dataset import (
     convert_egopose_to_matrix_numpy, invert_matrix_egopose_numpy,
     lidar_to_ego_matrix, transform_points_lidar_to_ego)
+from projects.mmdet3d_plugin.core.evaluation.occ_metrics import occ_pred_grid
 from projects.mmdet3d_plugin.datasets.pipelines.loading import _index_occ_root
 
 OCC_NAMES = [
@@ -718,20 +719,21 @@ def _camera_views(info, lidar2ego, paint, title_suffix=''):
 def render_frame(info, lidar2ego, gt_boxes, gt_labels, pred_boxes, pred_labels, pred_scores,
                  occ_gt, occ_pred, show_det, show_occ, det_bounds, label_range, grid,
                  class_names, z_bounds):
-    """拼一帧：检测环视、占用环视、俯视、后上方透视。俯视里绿是真值。"""
+    """拼一帧：原图环视、占用环视、俯视、后上方透视。俯视里绿是真值。"""
     pred_crop = None
     pred_bounds = None
     if show_occ and occ_pred is not None:
         pred_crop, pred_bounds = crop_occ(occ_pred, grid, label_range)
     rows = []
-    if show_det:
-        def paint_det(raw, lidar2img):
-            image = cv2.resize(raw, (IMG_W, IMG_H))
+
+    def paint_raw(raw, lidar2img):
+        image = cv2.resize(raw, (IMG_W, IMG_H))
+        if show_det:
             draw_boxes_on_image(
                 image, pred_boxes, pred_labels, lidar2img, class_names, scores=pred_scores)
-            return image
+        return image
 
-        rows.extend(_camera_views(info, lidar2ego, paint_det))
+    rows.extend(_camera_views(info, lidar2ego, paint_raw))
     if pred_crop is not None:
         def paint_occ(raw, lidar2img):
             image = np.full((IMG_H, IMG_W, 3), 255, dtype=np.uint8)
@@ -784,7 +786,7 @@ def main():
         dataset, samples_per_gpu=1, workers_per_gpu=0, dist=False, shuffle=False,
         nonshuffler_sampler=cfg.data.nonshuffler_sampler)
     model = build_model(cfg.model, test_cfg=cfg.get('test_cfg'))
-    load_checkpoint(model, args.checkpoint, map_location='cpu')
+    load_pretrained(model, args.checkpoint)
     model = MMDataParallel(model.cuda(), device_ids=[0])
     model.eval()
 
@@ -798,7 +800,7 @@ def main():
     label_range = list(cfg.model.occ_head.get(
         'occ_label_range', [-40.0, -40.0, -1.0, 40.0, 40.0, 5.4]))
     z_bounds = (label_range[2], label_range[5])
-    grid = cfg.model.img_view_transformer.grid_config
+    grid = occ_pred_grid(cfg.model)
     class_names = list(cfg.class_names)
     occ_index = _index_occ_root(cfg.occ_root) if show_occ else {}
     os.makedirs(args.out_dir, exist_ok=True)

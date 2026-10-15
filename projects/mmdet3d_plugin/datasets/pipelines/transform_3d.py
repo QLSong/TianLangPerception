@@ -17,6 +17,15 @@ import torch
 from PIL import Image
 
 
+def _photo_color(images):
+    """几何变换后的 BGR 图转成光度损失用的 RGB，范围 0 到 1。"""
+    packed = np.stack([np.asarray(image, dtype=np.float32) for image in images], axis=0)
+    rgb = packed[..., ::-1]
+    if float(rgb.max()) > 1.5:
+        rgb = rgb / 255.0
+    return np.transpose(rgb, (0, 3, 1, 2)).astype(np.float32)
+
+
 @PIPELINES.register_module()
 class PadMultiViewImage():
     """Pad the multi-view image.
@@ -168,8 +177,32 @@ class ResizeCropFlipRotImage():
         results['depths'] = new_depths
         results['img'] = new_imgs
         results['lidar2img'] = [results['intrinsics'][i] @ results['extrinsics'][i] for i in range(len(results['extrinsics']))]
-
+        if 'gs_m1_img' in results:
+            results['gs_color'] = _photo_color(new_imgs)
+            results['gs_color_m1'] = _photo_color([
+                self._geom_image(im, resize, resize_dims, crop, flip, rotate)
+                for im in results.pop('gs_m1_img')])
+            results['gs_color_p1'] = _photo_color([
+                self._geom_image(im, resize, resize_dims, crop, flip, rotate)
+                for im in results.pop('gs_p1_img')])
+            results['gs_semantic'] = np.stack([
+                self._geom_label(label, resize_dims, crop, flip)
+                for label in results.pop('gs_semantic_full')], axis=0)
         return results
+
+    def _geom_image(self, image, resize, resize_dims, crop, flip, rotate):
+        image, _ = self._img_transform(
+            Image.fromarray(np.uint8(image)),
+            resize=resize, resize_dims=resize_dims, crop=crop, flip=flip, rotate=rotate)
+        return np.asarray(image)
+
+    def _geom_label(self, label, resize_dims, crop, flip):
+        image = Image.fromarray(np.ascontiguousarray(label).astype(np.uint8))
+        image = image.resize(resize_dims, Image.NEAREST)
+        image = image.crop(crop)
+        if flip:
+            image = image.transpose(Image.FLIP_LEFT_RIGHT)
+        return np.asarray(image, dtype=np.int64)
 
     def _bboxes_transform(self, bboxes, centers2d, gt_labels, depths,resize, crop, flip):
         assert len(bboxes) == len(centers2d) == len(gt_labels) == len(depths)

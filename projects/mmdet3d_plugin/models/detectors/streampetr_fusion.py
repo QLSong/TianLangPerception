@@ -256,6 +256,14 @@ class StreamPETRFusion(Petr3D):
         grid = self.img_view_transformer.grid_config
         return (grid['x'][0], grid['y'][0], grid['x'][1], grid['y'][1])
 
+    def _needs_lidar(self):
+        """GaussianOcc 不读点云。占用只开这一支时不再跑 PointPillars。"""
+        if not self.use_lidar:
+            return False
+        if 'det' in self.tasks:
+            return True
+        return 'occ' in self.tasks and not isinstance(self.occ_head, GaussianOccHead)
+
     def _prepare_lidar(self, points):
         if not self.use_lidar:
             return None
@@ -410,7 +418,7 @@ class StreamPETRFusion(Petr3D):
         # else:
         data['img_feats'] = rec_img_feats
         losses = dict()
-        lidar_bev = self._prepare_lidar(points) if (train_det or train_occ) else None
+        lidar_bev = self._prepare_lidar(points) if self._needs_lidar() else None
         if train_det:
             if lidar_bev is not None:
                 data['lidar_bev'] = lidar_bev.unsqueeze(1).repeat(1, t, 1, 1, 1)
@@ -418,9 +426,21 @@ class StreamPETRFusion(Petr3D):
                 gt_bboxes_3d, gt_labels_3d, gt_bboxes, gt_labels, img_metas,
                 centers2d, depths, gt_bboxes_ignore, **data))
         if train_occ:
-            if voxel_semantics is None:
+            if isinstance(self.occ_head, GaussianOccHead) and self.occ_head.supervise != 'gt':
+                missing = [name for name in (
+                    'gs_color', 'gs_color_m1', 'gs_color_p1', 'gs_semantic',
+                    'gs_cam_T_m1', 'gs_cam_T_p1') if data.get(name) is None]
+                if missing:
+                    raise RuntimeError(
+                        'GaussianOcc 自监督缺少 {}。训练集需要 gsocc_supervise=True'.format(
+                            ', '.join(missing)))
+                losses.update(self.occ_head.loss_self(
+                    data['img_feats'], data['extrinsics'], data['intrinsics'],
+                    data['gs_color'], data['gs_color_m1'], data['gs_color_p1'],
+                    data['gs_cam_T_m1'], data['gs_cam_T_p1'], data['gs_semantic']))
+            elif voxel_semantics is None:
                 raise RuntimeError('task includes occ but the batch has no voxel_semantics')
-            if isinstance(self.occ_head, OPUSV1Head):
+            elif isinstance(self.occ_head, OPUSV1Head):
                 if mask_camera is None:
                     mask_camera = torch.ones_like(voxel_semantics)
                 preds = self.occ_head(
@@ -448,7 +468,7 @@ class StreamPETRFusion(Petr3D):
     def simple_test(self, img_metas, **data):
         data['img_feats'] = self.extract_img_feat(data['img'], 1)
         bbox_list = [dict() for _ in range(len(img_metas))]
-        need_lidar = self.use_lidar and ('det' in self.tasks or 'occ' in self.tasks)
+        need_lidar = self._needs_lidar()
         lidar_bev = self._prepare_lidar(self._points_for_test(data.get('points'))) if need_lidar else None
         if 'det' in self.tasks:
             if lidar_bev is not None:

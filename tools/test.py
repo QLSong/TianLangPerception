@@ -23,16 +23,16 @@ import warnings
 from mmcv import Config, DictAction
 from mmcv.cnn import fuse_conv_bn
 from mmcv.parallel import MMDataParallel, MMDistributedDataParallel
-from mmcv.runner import (get_dist_info, init_dist, load_checkpoint,
-                         wrap_fp16_model)
+from mmcv.runner import get_dist_info, init_dist, wrap_fp16_model
 
 from mmdet3d.datasets import build_dataset
 from projects.mmdet3d_plugin.datasets.builder import build_dataloader
 from mmdet3d.models import build_model
 from mmdet.apis import set_random_seed
 from projects.mmdet3d_plugin.core.apis.test import collect_results_cpu
+from projects.mmdet3d_plugin.core.checkpoint import load_pretrained
 from projects.mmdet3d_plugin.core.evaluation.det_metrics import evaluate_det, pack_boxes
-from projects.mmdet3d_plugin.core.evaluation.occ_metrics import OccMeter, crop_occ
+from projects.mmdet3d_plugin.core.evaluation.occ_metrics import OccMeter, crop_occ, occ_pred_grid
 from projects.mmdet3d_plugin.datasets.nuscenes_dataset import lidar_to_ego_matrix
 from projects.mmdet3d_plugin.datasets.pipelines.loading import _index_occ_root
 import torch.distributed as dist
@@ -276,7 +276,7 @@ def main():
     fp16_cfg = cfg.get('fp16', None)
     if fp16_cfg is not None:
         wrap_fp16_model(model)
-    checkpoint = load_checkpoint(model, args.checkpoint, map_location='cpu')
+    checkpoint = load_pretrained(model, args.checkpoint)
     if args.fuse_conv_bn:
         model = fuse_conv_bn(model)
     # old versions did not save class info in checkpoints, this walkaround is
@@ -320,7 +320,7 @@ def main():
     occ_index = _index_occ_root(cfg.occ_root) if (show_occ and (occ_meter or args.vis_dir)) else {}
     label_range = list(cfg.model.occ_head.get(
         'occ_label_range', [-40.0, -40.0, -1.0, 40.0, 40.0, 5.4]))
-    grid = cfg.model.img_view_transformer.grid_config if show_occ else None
+    grid = occ_pred_grid(cfg.model) if show_occ else None
     if args.vis_dir and rank == 0:
         os.makedirs(args.vis_dir, exist_ok=True)
     if distributed:

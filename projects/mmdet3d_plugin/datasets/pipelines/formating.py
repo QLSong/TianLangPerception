@@ -54,7 +54,8 @@ class PETRFormatBundle3D(DefaultFormatBundle):
             else:
                  results[key] = DC(to_tensor(np.array(results[key], dtype=np.float32)))
 
-        for key in ('voxel_semantics', 'mask_camera'):
+        for key in ('voxel_semantics', 'mask_camera', 'gs_color', 'gs_color_m1',
+                    'gs_color_p1', 'gs_semantic', 'gs_cam_T_m1', 'gs_cam_T_p1'):
             if key in results and not isinstance(results[key], DC):
                 results[key] = DC(to_tensor(np.ascontiguousarray(results[key])), stack=True, pad_dims=None)
 

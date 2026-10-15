@@ -21,6 +21,27 @@ VOXEL = 0.4
 RAY_THS = (1.0, 2.0, 4.0)
 
 
+def occ_pred_grid(model_cfg):
+    """预测占用的 xy 网格。平面投影用视角变换的格子，OPUS 和 GaussianOcc 直接用占用范围。"""
+    transformer = model_cfg.get('img_view_transformer', None)
+    if transformer is not None:
+        return transformer['grid_config']
+    head = model_cfg.occ_head
+    pc_range = head.get('pc_range', None)
+    voxel_size = head.get('voxel_size', None)
+    if pc_range is not None and voxel_size is not None:
+        return dict(
+            x=[pc_range[0], pc_range[3], voxel_size[0]],
+            y=[pc_range[1], pc_range[4], voxel_size[1]])
+    real_size = head.get('real_size', None)
+    if real_size is not None:
+        return dict(
+            x=[real_size[0], real_size[1], (real_size[1] - real_size[0]) / 200.0],
+            y=[real_size[2], real_size[3], (real_size[3] - real_size[2]) / 200.0])
+    label = head.get('occ_label_range', [-40.0, -40.0, -1.0, 40.0, 40.0, 5.4])
+    return dict(x=[label[0], label[3], 0.4], y=[label[1], label[4], 0.4])
+
+
 def crop_occ(pred, grid, label_range):
     """和 vis_mini.crop_occ 相同的窗口。"""
     x0, _, dx = grid['x']

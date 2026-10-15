@@ -27,6 +27,7 @@ class CustomNuScenesDataset(NuScenesDataset):
     """
 
     def __init__(self, collect_keys, seq_mode=False, seq_split_num=1, num_frame_losses=1, queue_length=8, random_length=0, *args, **kwargs):
+        gsocc_supervise = kwargs.pop('gsocc_supervise', False)
         super().__init__(*args, **kwargs)
         self.queue_length = queue_length
         self.collect_keys = collect_keys
@@ -39,6 +40,31 @@ class CustomNuScenesDataset(NuScenesDataset):
             self.seq_split_num = seq_split_num
             self.random_length = 0
             self._set_sequence_group_flag() # Must be called after load_annotations b/c load_annotations does sorting.
+        if gsocc_supervise:
+            self._attach_gsocc_supervise()
+
+    def _attach_gsocc_supervise(self):
+        """只在 GaussianOcc 训练集上加前后帧和二维语义。pipeline 在配置合并后才插得进去。"""
+        from projects.mmdet3d_plugin.datasets.pipelines.loading import LoadGaussianOccSupervise
+        transforms = self.pipeline.transforms
+        loader = LoadGaussianOccSupervise(data_root=self.data_root)
+        insert_at = next(
+            i for i, step in enumerate(transforms)
+            if step.__class__.__name__ == 'ResizeCropFlipRotImage')
+        transforms.insert(insert_at, loader)
+        extra = [
+            'gs_color', 'gs_color_m1', 'gs_color_p1', 'gs_semantic',
+            'gs_cam_T_m1', 'gs_cam_T_p1']
+        for step in transforms:
+            if step.__class__.__name__ != 'Collect3D' or not hasattr(step, 'keys'):
+                continue
+            keys = list(step.keys)
+            if 'gt_bboxes_3d' not in keys:
+                continue
+            for name in extra:
+                if name not in keys:
+                    keys.append(name)
+            step.keys = keys
 
     def _set_sequence_group_flag(self):
         """
@@ -215,6 +241,15 @@ class CustomNuScenesDataset(NuScenesDataset):
                 intrinsics.append(viewpad)
                 extrinsics.append(ego2cam_rt)
                 lidar2img_rts.append(lidar2img_rt)
+            cam_ego2global = []
+            cam_to_ego = []
+            cam_sd_token = []
+            for cam_info in info['cams'].values():
+                cam_ego2global.append(_qt_matrix(
+                    cam_info['ego2global_rotation'], cam_info['ego2global_translation']))
+                cam_to_ego.append(_qt_matrix(
+                    cam_info['sensor2ego_rotation'], cam_info['sensor2ego_translation']))
+                cam_sd_token.append(cam_info['sample_data_token'])
                 
             if not self.test_mode: # for seq_mode
                 prev_exists  = not (index == 0 or self.flag[index - 1] != self.flag[index])
@@ -229,6 +264,9 @@ class CustomNuScenesDataset(NuScenesDataset):
                     intrinsics=intrinsics,
                     extrinsics=extrinsics,
                     prev_exists=prev_exists,
+                    cam_ego2global=cam_ego2global,
+                    cam_to_ego=cam_to_ego,
+                    cam_sd_token=cam_sd_token,
                 ))
         if not self.test_mode:
             annos = self.get_ann_info(index)
@@ -276,6 +314,31 @@ class CustomNuScenesDataset(NuScenesDataset):
                     for sample in results]
         return super().format_results(results, jsonfile_prefix)
 
+    def _format_bbox(self, results, jsonfile_prefix=None):
+        """预测框已经在自车坐标。父类导出时会再乘 lidar2ego，这里改成只乘 ego2global。"""
+        import mmdet3d.datasets.nuscenes_dataset as nusc_ds
+        saved = nusc_ds.lidar_nusc_box_to_global
+        nusc_ds.lidar_nusc_box_to_global = _ego_box_to_global
+        try:
+            return super()._format_bbox(results, jsonfile_prefix)
+        finally:
+            nusc_ds.lidar_nusc_box_to_global = saved
+
+def _ego_box_to_global(info, boxes, classes, eval_configs, eval_version='detection_cvpr_2019'):
+    """自车坐标的框滤掉感知范围外的，再变到全局。不再乘 lidar2ego。"""
+    del eval_version
+    box_list = []
+    for box in boxes:
+        radius = np.linalg.norm(box.center[:2], 2)
+        det_range = eval_configs.class_range[classes[box.label]]
+        if radius > det_range:
+            continue
+        box.rotate(Quaternion(info['ego2global_rotation']))
+        box.translate(np.array(info['ego2global_translation']))
+        box_list.append(box)
+    return box_list
+
+
 def lidar_to_ego_matrix(info):
     """LIDAR_TOP 到自车。nuScenes 上这是绕 z 轴约 -90°，激光雷达 +y 才是车头。"""
     rotation = Quaternion(info['lidar2ego_rotation']).rotation_matrix
@@ -320,6 +383,13 @@ def invert_matrix_egopose_numpy(egopose):
     inverse_matrix[:3, 3] = -np.dot(rotation.T, translation)
     inverse_matrix[3, 3] = 1.0
     return inverse_matrix
+
+def _qt_matrix(rotation, translation):
+    rot = np.asarray(rotation)
+    if rot.shape == (4,):
+        rot = Quaternion(rot).rotation_matrix
+    return convert_egopose_to_matrix_numpy(rot, translation)
+
 
 def convert_egopose_to_matrix_numpy(rotation, translation):
     transformation_matrix = np.zeros((4, 4), dtype=np.float32)

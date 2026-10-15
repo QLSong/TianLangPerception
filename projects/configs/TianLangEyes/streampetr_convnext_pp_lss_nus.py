@@ -40,7 +40,7 @@ class_names = [
 ]
 num_gpus = 1
 batch_size = 4
-num_iters_per_epoch = 50000 // (num_gpus * batch_size)
+num_iters_per_epoch = 20000 // (num_gpus * batch_size)
 num_epochs = 24
 queue_length = 1
 num_frame_losses = 1
@@ -266,7 +266,7 @@ data = dict(
               classes=class_names, modality=input_modality),
     shuffler_sampler=dict(type='InfiniteGroupEachSampleInBatchSampler'),
     nonshuffler_sampler=dict(type='DistributedSampler'))
-optimizer = dict(type='AdamW', lr=1e-3, weight_decay=0.01)
+optimizer = dict(type='AdamW', lr=2e-4, weight_decay=0.01)
 optimizer_config = dict(
     type='Fp16OptimizerHook', loss_scale='dynamic',
     grad_clip=dict(max_norm=35, norm_type=2))
@@ -278,5 +278,7 @@ evaluation = dict(interval=_eval_interval, pipeline=test_pipeline)
 find_unused_parameters = True
 checkpoint_config = dict(interval=num_iters_per_epoch, max_keep_ckpts=3)
 runner = dict(type='IterBasedRunner', max_iters=num_epochs * num_iters_per_epoch)
-load_from = None
+# 上一轮训练好的权重。只加载名字和形状都能对上的参数，不恢复优化器和迭代数。
+# 要从断点接着训，把这个改成 None，并设置 resume_from。
+load_from = 'work_dirs/streampetr_convnext_pp_lss_nus/iter_120000_notime.pth'
 resume_from = None

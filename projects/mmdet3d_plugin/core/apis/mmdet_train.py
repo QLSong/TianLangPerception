@@ -28,6 +28,7 @@ import os.path as osp
 from projects.mmdet3d_plugin.datasets.builder import build_dataloader
 from projects.mmdet3d_plugin.core.evaluation.eval_hooks import CustomDistEvalHook
 from projects.mmdet3d_plugin.core.hooks.tb_logger import FlatTensorboardLoggerHook  # noqa: F401
+from projects.mmdet3d_plugin.core.checkpoint import load_pretrained
 from projects.mmdet3d_plugin.datasets import custom_build_dataset
 
 
@@ -234,6 +235,6 @@ def custom_train_detector(model,
     if cfg.resume_from:
         runner.resume(cfg.resume_from)
     elif cfg.load_from:
-        runner.load_checkpoint(cfg.load_from)
+        load_pretrained(runner.model, cfg.load_from, logger=runner.logger)
     runner.run(data_loaders, cfg.workflow)
 
