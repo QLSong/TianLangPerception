@@ -9,7 +9,7 @@ plugin = True
 plugin_dir = 'projects/mmdet3d_plugin/'
 # DINOv3 ConvNeXt-Tiny, backbone weights frozen.
 # task: 'det' | 'occ' | 'both'
-task = 'det'
+task = 'both'
 # 图像交叉注意力。False 用原来的全连接注意力，True 用可变形注意力。
 use_img_deform_attn = True
 # 关掉后检测和占用都不再读点云。打开时两个任务共用 PointPillars BEV。
@@ -280,5 +280,5 @@ checkpoint_config = dict(interval=num_iters_per_epoch, max_keep_ckpts=3)
 runner = dict(type='IterBasedRunner', max_iters=num_epochs * num_iters_per_epoch)
 # 上一轮训练好的权重。只加载名字和形状都能对上的参数，不恢复优化器和迭代数。
 # 要从断点接着训，把这个改成 None，并设置 resume_from。
-load_from = 'work_dirs/streampetr_convnext_pp_lss_nus/iter_120000_notime.pth'
+load_from = 'work_dirs/streampetr_convnext_pp_lss_nus/iter_40000_dettime.pth'
 resume_from = None

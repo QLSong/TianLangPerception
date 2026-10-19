@@ -182,6 +182,8 @@ class StreamPETRLidarHead(StreamPETRHead):
         hidden = query.transpose(0, 1)
         cls_score = self.cls_branches[level](hidden)
         delta = self.reg_branches[level](hidden)
+        # cls_score = self.cls_branches(hidden)
+        # delta = self.reg_branches(hidden)
         base = inverse_sigmoid(reference_points.clamp(1e-4, 1 - 1e-4))
         centers = (delta[..., 0:3] + base).sigmoid()
         coords = torch.cat([centers, delta[..., 3:]], dim=-1)

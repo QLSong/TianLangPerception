@@ -27,12 +27,49 @@ def _index_occ_root(occ_root):
     return index
 
 
+def _resample_occ(semantics, mask, src_range, src_voxel, dst_range, dst_voxel, empty=17):
+    """最近邻把 Occ3D 体素采到目标网格。落在源范围外的格子标成空，可见掩码为假。"""
+    src_range = np.asarray(src_range, dtype=np.float64)
+    dst_range = np.asarray(dst_range, dtype=np.float64)
+    src_voxel = np.broadcast_to(np.asarray(src_voxel, dtype=np.float64), (3,))
+    dst_voxel = np.broadcast_to(np.asarray(dst_voxel, dtype=np.float64), (3,))
+    dst_size = tuple(int(round((dst_range[i + 3] - dst_range[i]) / dst_voxel[i])) for i in range(3))
+    src_size = tuple(int(round((src_range[i + 3] - src_range[i]) / src_voxel[i])) for i in range(3))
+    if tuple(semantics.shape) != src_size:
+        raise RuntimeError('Occ3D 标签 {} 和源网格 {} 不一致'.format(semantics.shape, src_size))
+    axes = [
+        dst_range[i] + (np.arange(dst_size[i]) + 0.5) * dst_voxel[i]
+        for i in range(3)]
+    gx, gy, gz = np.meshgrid(axes[0], axes[1], axes[2], indexing='ij')
+    sx = np.floor((gx - src_range[0]) / src_voxel[0]).astype(np.int64)
+    sy = np.floor((gy - src_range[1]) / src_voxel[1]).astype(np.int64)
+    sz = np.floor((gz - src_range[2]) / src_voxel[2]).astype(np.int64)
+    valid = (
+        (sx >= 0) & (sx < src_size[0])
+        & (sy >= 0) & (sy < src_size[1])
+        & (sz >= 0) & (sz < src_size[2]))
+    out = np.full(dst_size, empty, dtype=semantics.dtype)
+    out_mask = np.zeros(dst_size, dtype=bool)
+    out[valid] = semantics[sx[valid], sy[valid], sz[valid]]
+    out_mask[valid] = np.asarray(mask, dtype=bool)[sx[valid], sy[valid], sz[valid]]
+    return np.ascontiguousarray(out), np.ascontiguousarray(out_mask)
+
+
 @PIPELINES.register_module()
 class LoadOcc3DFromFile:
-    """Load Occ3D-nuScenes semantics and camera visibility mask."""
+    """Load Occ3D-nuScenes semantics and camera visibility mask.
 
-    def __init__(self, occ_root):
+    target_range 和 target_voxel 都给出时，把 0.4 m 的标签最近邻采到这个网格。
+    """
+
+    def __init__(self, occ_root, target_range=None, target_voxel=None,
+                 src_range=(-40.0, -40.0, -1.0, 40.0, 40.0, 5.4),
+                 src_voxel=(0.4, 0.4, 0.4)):
         self.occ_root = occ_root
+        self.target_range = target_range
+        self.target_voxel = target_voxel
+        self.src_range = src_range
+        self.src_voxel = src_voxel
 
     def __call__(self, results):
         token = results.get('sample_idx', results.get('sample_token'))
@@ -45,8 +82,14 @@ class LoadOcc3DFromFile:
             raise FileNotFoundError(
                 f'Occ3D label not found for sample {token} under {self.occ_root}')
         occ = np.load(path)
-        results['voxel_semantics'] = np.ascontiguousarray(occ['semantics'])
-        results['mask_camera'] = np.ascontiguousarray(occ['mask_camera'].astype(bool))
+        semantics = np.ascontiguousarray(occ['semantics'])
+        mask = np.ascontiguousarray(occ['mask_camera'].astype(bool))
+        if self.target_range is not None and self.target_voxel is not None:
+            semantics, mask = _resample_occ(
+                semantics, mask, self.src_range, self.src_voxel,
+                self.target_range, self.target_voxel)
+        results['voxel_semantics'] = semantics
+        results['mask_camera'] = mask
         return results
 
 

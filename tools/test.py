@@ -316,11 +316,21 @@ def main():
             print('配置 task={}，跳过 {}'.format(cfg.model.get('tasks'), '、'.join(skipped)))
     indices = sampler_indices(len(dataset), rank, world_size)
     det_records = []
-    occ_meter = OccMeter() if 'occ' in metrics else None
-    occ_index = _index_occ_root(cfg.occ_root) if (show_occ and (occ_meter or args.vis_dir)) else {}
-    label_range = list(cfg.model.occ_head.get(
-        'occ_label_range', [-40.0, -40.0, -1.0, 40.0, 40.0, 5.4]))
-    grid = occ_pred_grid(cfg.model) if show_occ else None
+    occ_index = _index_occ_root(cfg.occ_root) if (show_occ and ('occ' in metrics or args.vis_dir)) else {}
+    if show_occ:
+        label_range = list(cfg.model.occ_head.get(
+            'occ_label_range', [-40.0, -40.0, -1.0, 40.0, 40.0, 5.4]))
+        grid = occ_pred_grid(cfg.model)
+        occ_dz = int(cfg.model.occ_head.Dz)
+        occ_voxel = [
+            float(grid['x'][2]), float(grid['y'][2]),
+            (label_range[5] - label_range[2]) / occ_dz]
+    else:
+        label_range = list(cfg.point_cloud_range)
+        grid = None
+        occ_dz = 0
+        occ_voxel = None
+    occ_meter = OccMeter(pc_min=label_range[:3], voxel=occ_voxel[0]) if 'occ' in metrics else None
     if args.vis_dir and rank == 0:
         os.makedirs(args.vis_dir, exist_ok=True)
     if distributed:
@@ -359,6 +369,16 @@ def main():
             occ_file = np.load(gt_path)
             occ_gt = occ_file['semantics']
             occ_mask = occ_file['mask_camera'].astype(bool)
+            target = (
+                int(round((label_range[3] - label_range[0]) / occ_voxel[0])),
+                int(round((label_range[4] - label_range[1]) / occ_voxel[1])),
+                occ_dz)
+            if tuple(occ_gt.shape) != target:
+                from projects.mmdet3d_plugin.datasets.pipelines.loading import _resample_occ
+                occ_gt, occ_mask = _resample_occ(
+                    occ_gt, occ_mask,
+                    (-40.0, -40.0, -1.0, 40.0, 40.0, 5.4), (0.4, 0.4, 0.4),
+                    label_range, occ_voxel)
         if occ_meter is not None:
             pred_occ = crop_occ(result['occ'], grid, label_range)
             origin = lidar_to_ego_matrix(info)[:3, 3]

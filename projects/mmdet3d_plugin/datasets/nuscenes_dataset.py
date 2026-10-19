@@ -28,6 +28,7 @@ class CustomNuScenesDataset(NuScenesDataset):
 
     def __init__(self, collect_keys, seq_mode=False, seq_split_num=1, num_frame_losses=1, queue_length=8, random_length=0, *args, **kwargs):
         gsocc_supervise = kwargs.pop('gsocc_supervise', False)
+        self.class_merge = kwargs.pop('class_merge', None)
         super().__init__(*args, **kwargs)
         self.queue_length = queue_length
         self.collect_keys = collect_keys
@@ -285,9 +286,40 @@ class CustomNuScenesDataset(NuScenesDataset):
 
     def get_ann_info(self, index):
         ann = super().get_ann_info(index)
+        if self.class_merge:
+            names = [self.class_merge.get(str(name), str(name)) for name in ann['gt_names']]
+            ann['gt_names'] = np.array(names)
+            ann['gt_labels_3d'] = np.array([
+                self.CLASSES.index(name) if name in self.CLASSES else -1
+                for name in names
+            ], dtype=np.int64)
         ann['gt_bboxes_3d'] = transform_boxes_lidar_to_ego(
             ann['gt_bboxes_3d'], self.data_infos[index])
         return ann
+
+    def evaluate(self, results, metric='bbox', logger=None, jsonfile_prefix=None,
+                 result_names=['pts_bbox'], show=False, out_dir=None, pipeline=None):
+        """合并过的类别不在 nuScenes 官方 10 类里，改用自车系上的检测指标。"""
+        if not self.class_merge:
+            return super().evaluate(
+                results, metric=metric, logger=logger, jsonfile_prefix=jsonfile_prefix,
+                result_names=result_names, show=show, out_dir=out_dir, pipeline=pipeline)
+        from projects.mmdet3d_plugin.core.evaluation.det_metrics import evaluate_det, pack_boxes
+        records = []
+        for index, result in enumerate(results):
+            pred = result.get('pts_bbox', result)
+            ann = self.get_ann_info(index)
+            records.append(dict(
+                token=self.data_infos[index]['token'],
+                gt=pack_boxes(ann['gt_bboxes_3d'], ann['gt_labels_3d']),
+                pred=pack_boxes(pred['boxes_3d'], pred['labels_3d'], pred['scores_3d']),
+            ))
+        metrics, text = evaluate_det(records, list(self.CLASSES))
+        print('\n' + text)
+        return {
+            'pts_bbox_NuScenes/mAP': float(metrics['mAP']),
+            'pts_bbox_NuScenes/NDS': float(metrics['NDS']),
+        }
 
     def __getitem__(self, idx):
         """Get item from infos according to the given index.

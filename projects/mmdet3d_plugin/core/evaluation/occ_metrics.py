@@ -104,13 +104,15 @@ def _ray_cast(volume, origin, rays, pc_min, voxel, free, step, nstep):
 class OccMeter:
     """逐帧累加混淆矩阵和 RayIoU 计数，多卡上可以把数组相加。"""
 
-    def __init__(self):
+    def __init__(self, pc_min=None, voxel=0.4):
         n = len(OCC_NAMES)
         self.hist = np.zeros((n, n), dtype=np.int64)
         self.gt_cnt = np.zeros(n, dtype=np.int64)
         self.pred_cnt = np.zeros(n, dtype=np.int64)
         self.tp_cnt = np.zeros((len(RAY_THS), n), dtype=np.int64)
         self.rays = generate_lidar_rays()
+        self.pc_min = PC_MIN if pc_min is None else np.asarray(pc_min, dtype=np.float64)
+        self.voxel = float(voxel)
 
     def update(self, pred, gt, mask, origin):
         pred = np.asarray(pred)
@@ -136,10 +138,12 @@ class OccMeter:
 
     def _update_ray(self, pred, gt, origin):
         origin = np.asarray(origin, dtype=np.float64).reshape(3)
+        step = self.voxel * 0.5
+        nstep = int(math.ceil(self.voxel * max(pred.shape) / step))
         pred_depth, pred_label = _ray_cast(
-            pred.astype(np.uint8), origin, self.rays, PC_MIN, VOXEL, FREE, VOXEL * 0.5, 400)
+            pred.astype(np.uint8), origin, self.rays, self.pc_min, self.voxel, FREE, step, nstep)
         gt_depth, gt_label = _ray_cast(
-            gt.astype(np.uint8), origin, self.rays, PC_MIN, VOXEL, FREE, VOXEL * 0.5, 400)
+            gt.astype(np.uint8), origin, self.rays, self.pc_min, self.voxel, FREE, step, nstep)
         valid = gt_label != FREE
         pred_label = pred_label[valid]
         gt_label = gt_label[valid]

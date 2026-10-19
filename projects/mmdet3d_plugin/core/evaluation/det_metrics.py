@@ -5,16 +5,60 @@ precision、recall 是分数阈值处、中心距 2 米的工作点。
 没有属性标注，mAAE 不计入 NDS。
 """
 import numpy as np
-from nuscenes.eval.common.data_classes import EvalBoxes
+from nuscenes.eval.common.data_classes import EvalBox, EvalBoxes
 from nuscenes.eval.common.utils import center_distance
 from nuscenes.eval.detection.algo import accumulate, calc_ap, calc_tp
-from nuscenes.eval.detection.data_classes import DetectionBox
 from pyquaternion import Quaternion
+
+
+class _DetBox(EvalBox):
+    """和 nuScenes DetectionBox 字段相同，但允许合并后的类别名。
+
+    accumulate 只按 detection_name 字符串分组，不查官方 10 类名单。
+    """
+
+    def __init__(self, sample_token='', translation=(0, 0, 0), size=(0, 0, 0),
+                 rotation=(0, 0, 0, 0), velocity=(0, 0), ego_translation=(0, 0, 0),
+                 num_pts=-1, detection_name='car', detection_score=-1.0, attribute_name=''):
+        super().__init__(sample_token, translation, size, rotation, velocity, ego_translation, num_pts)
+        self.detection_name = detection_name
+        self.detection_score = float(detection_score)
+        self.attribute_name = attribute_name
+
+    def serialize(self):
+        return {
+            'sample_token': self.sample_token,
+            'translation': self.translation,
+            'size': self.size,
+            'rotation': self.rotation,
+            'velocity': self.velocity,
+            'ego_translation': self.ego_translation,
+            'num_pts': self.num_pts,
+            'detection_name': self.detection_name,
+            'detection_score': self.detection_score,
+            'attribute_name': self.attribute_name,
+        }
+
+    @classmethod
+    def deserialize(cls, content):
+        return cls(
+            sample_token=content['sample_token'],
+            translation=tuple(content['translation']),
+            size=tuple(content['size']),
+            rotation=tuple(content['rotation']),
+            velocity=tuple(content['velocity']),
+            ego_translation=tuple(content.get('ego_translation', (0.0, 0.0, 0.0))),
+            num_pts=int(content.get('num_pts', -1)),
+            detection_name=content['detection_name'],
+            detection_score=float(content.get('detection_score', -1.0)),
+            attribute_name=content.get('attribute_name', ''),
+        )
 
 CLASS_RANGE = {
     'car': 50, 'truck': 50, 'bus': 50, 'trailer': 50,
     'construction_vehicle': 50, 'pedestrian': 40, 'motorcycle': 40,
     'bicycle': 40, 'traffic_cone': 30, 'barrier': 30,
+    'other_vehicle': 50, 'cycle': 40,
 }
 DIST_THS = (0.5, 1.0, 2.0, 4.0)
 DIST_TH_TP = 2.0
@@ -88,7 +132,7 @@ def _to_boxes(token, packed, class_names, score_thr=None):
         if score_thr is not None and score < score_thr:
             continue
         quat = Quaternion(axis=[0, 0, 1], radians=float(packed['yaw'][i]))
-        boxes.append(DetectionBox(
+        boxes.append(_DetBox(
             sample_token=token,
             translation=tuple(float(v) for v in packed['center'][i]),
             size=tuple(float(v) for v in packed['size'][i]),

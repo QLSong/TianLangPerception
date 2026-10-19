@@ -797,10 +797,14 @@ def main():
     show_occ = 'occ' in tasks
     pc = cfg.point_cloud_range
     det_bounds = (pc[0], pc[1], pc[3], pc[4])
-    label_range = list(cfg.model.occ_head.get(
-        'occ_label_range', [-40.0, -40.0, -1.0, 40.0, 40.0, 5.4]))
+    if show_occ:
+        label_range = list(cfg.model.occ_head.get(
+            'occ_label_range', [-40.0, -40.0, -1.0, 40.0, 40.0, 5.4]))
+        grid = occ_pred_grid(cfg.model)
+    else:
+        label_range = list(cfg.point_cloud_range)
+        grid = None
     z_bounds = (label_range[2], label_range[5])
-    grid = occ_pred_grid(cfg.model)
     class_names = list(cfg.class_names)
     occ_index = _index_occ_root(cfg.occ_root) if show_occ else {}
     os.makedirs(args.out_dir, exist_ok=True)
@@ -829,7 +833,20 @@ def main():
             gt_path = occ_index.get(info['token'])
             if gt_path is None:
                 raise FileNotFoundError('没有找到 {} 的占用标签'.format(info['token']))
-            occ_gt = np.load(gt_path)['semantics']
+            occ_file = np.load(gt_path)
+            occ_gt = occ_file['semantics']
+            z_voxel = (label_range[5] - label_range[2]) / int(cfg.model.occ_head.Dz)
+            occ_voxel = [float(grid['x'][2]), float(grid['y'][2]), z_voxel]
+            target = (
+                int(round((label_range[3] - label_range[0]) / occ_voxel[0])),
+                int(round((label_range[4] - label_range[1]) / occ_voxel[1])),
+                int(cfg.model.occ_head.Dz))
+            if tuple(occ_gt.shape) != target:
+                from projects.mmdet3d_plugin.datasets.pipelines.loading import _resample_occ
+                occ_gt, _ = _resample_occ(
+                    occ_gt, np.ones_like(occ_gt, dtype=bool),
+                    (-40.0, -40.0, -1.0, 40.0, 40.0, 5.4), (0.4, 0.4, 0.4),
+                    label_range, occ_voxel)
         image = render_frame(
             info, lidar2ego, gt_boxes, gt_labels, pred_boxes, pred_labels, pred_scores,
             occ_gt, result.get('occ'), show_det, show_occ, det_bounds, label_range, grid,

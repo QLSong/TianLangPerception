@@ -1,0 +1,7 @@
+.git
+data
+ckpts
+work_dirs
+**/__pycache__
+**/*.pyc
+**/.vscode
