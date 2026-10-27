@@ -176,7 +176,7 @@ ida_aug_conf = dict(
 det_keys = ['points'] if use_lidar else []
 occ_keys = ['voxel_semantics', 'mask_camera'] if task in ('occ', 'both') else []
 train_pipeline = [
-    dict(type='LoadMultiViewImageAndPoints', to_float32=True,
+    dict(type='LoadMultiViewImageAndPoints', to_float32=False,
          load_points=use_lidar,
          coord_type='LIDAR', load_dim=5, use_dim=4)]
 if task in ('occ', 'both'):
@@ -198,7 +198,7 @@ train_pipeline += [
                     'gt_bboxes_3d', 'gt_labels_3d')),
 ]
 test_pipeline = [
-    dict(type='LoadMultiViewImageAndPoints', to_float32=True,
+    dict(type='LoadMultiViewImageAndPoints', to_float32=False,
          load_points=use_lidar,
          coord_type='LIDAR', load_dim=5, use_dim=4)]
 test_pipeline += [

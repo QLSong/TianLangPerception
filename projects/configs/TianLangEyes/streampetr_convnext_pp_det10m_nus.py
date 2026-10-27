@@ -8,12 +8,16 @@ plugin_dir = 'projects/mmdet3d_plugin/'
 # task: 'det' | 'occ' | 'both'
 task = 'both'
 # 图像交叉注意力。False 用原来的全连接注意力，True 用可变形注意力。
+# det_from_view 为 True 时检测不走这条，改看下面 PlaneViewTransformer 的 BEV。
 use_img_deform_attn = True
+# 检测不从原图特征取 token，改为接 img_view_transformer 输出的相机 BEV。
+det_from_view = True
+_view_channels = 64
 # 关掉后检测和占用都不再读点云。打开时两个任务共用 PointPillars BEV。
-use_lidar = True
+use_lidar = False
 # 检测跨帧 memory。False 时 query 只看当前帧，不传播历史框，也不写 memory。
 # True 时第一层只用当前帧，refine 后用历史框换掉低分 query，之后每层把预测中心写回采样点。
-use_det_temporal = True
+use_det_temporal = False
 data_root = './data/nuscenes/'
 occ_root = data_root + 'gts/'
 
@@ -21,14 +25,16 @@ occ_root = data_root + 'gts/'
 # 检测 z 仍是 [-5, 3]。SECOND+FPN 输出格子是 pillar 的 2 倍（0.4 m，48×48）。
 # position_range 比检测框四周再扩 10 m，给图像位置编码留白。
 # 占用单独用 0.1 m 格子：xy 同样 ±9.6 m（192×192），z 从 -2 m 到 1 m（30 层）。
-point_cloud_range = [-9.6, -9.6, -5.0, 9.6, 9.6, 3.0]
+# point_cloud_range = [-9.6, -9.6, -5.0, 9.6, 9.6, 3.0]
+point_cloud_range = [-9.6, -9.6, -5.5, 9.6, 9.6, 2.5]
 position_range = [-19.6, -19.6, -10.0, 19.6, 19.6, 10.0]
 lidar_pc_range = [-9.6, -9.6, -5.0, 9.6, 9.6, 3.0]
 voxel_size = [0.2, 0.2, 8]
 lidar_voxel_size = [0.2, 0.2, 8.0]
 _pillar_nx = int(round((lidar_pc_range[3] - lidar_pc_range[0]) / lidar_voxel_size[0]))
 _pillar_ny = int(round((lidar_pc_range[4] - lidar_pc_range[1]) / lidar_voxel_size[1]))
-occ_range = [-9.6, -9.6, -2.0, 9.6, 9.6, 1.0]
+# occ_range = [-9.6, -9.6, -2.0, 9.6, 9.6, 1.0]
+occ_range = [-9.6, -9.6, -2.5, 9.6, 9.6, 0.5]
 occ_voxel = [0.1, 0.1, 0.1]
 _occ_dz = int(round((occ_range[5] - occ_range[2]) / occ_voxel[2]))
 img_norm_cfg = dict(
@@ -45,7 +51,7 @@ class_merge = dict(
     bicycle='cycle',
 )
 num_gpus = 1
-batch_size = 4
+batch_size = 32
 num_iters_per_epoch = 60000 // (num_gpus * batch_size)
 num_epochs = 24
 queue_length = 1
@@ -62,6 +68,7 @@ model = dict(
     type='StreamPETRFusion',
     tasks=task,
     use_lidar=use_lidar,
+    det_from_view=det_from_view,
     num_frame_head_grads=1,
     num_frame_backbone_grads=1,
     num_frame_losses=1,
@@ -87,12 +94,13 @@ model = dict(
             y=[occ_range[1], occ_range[4], occ_voxel[1]]),
         input_size=(256, 704),
         in_channels=256,
-        out_channels=64,
+        out_channels=_view_channels,
         downsample=16,
         bev_planes=(-1.5, -0.5, 0.5)),
+        # bev_planes=(-1.0, 0, 1.0)),
     bev_backbone=dict(
         type='UNet',
-        in_channels=64,
+        in_channels=_view_channels,
         base_channels=64,
         num_stages=4,
         strides=(1, 1, 1, 1),
@@ -120,6 +128,8 @@ model = dict(
         type='StreamPETRLidarHead',
         lidar_in_channels=384,
         lidar_num_points=4,
+        use_img_bev=det_from_view,
+        img_bev_channels=_view_channels,
         num_classes=len(class_names),
         in_channels=256,
         num_query=384,
@@ -188,7 +198,7 @@ ida_aug_conf = dict(
 det_keys = ['points'] if use_lidar else []
 occ_keys = ['voxel_semantics', 'mask_camera'] if task in ('occ', 'both') else []
 train_pipeline = [
-    dict(type='LoadMultiViewImageAndPoints', to_float32=True,
+    dict(type='LoadMultiViewImageAndPoints', to_float32=False,
          load_points=use_lidar,
          coord_type='LIDAR', load_dim=5, use_dim=4)]
 if task in ('occ', 'both'):
@@ -212,7 +222,7 @@ train_pipeline += [
                     'gt_bboxes_3d', 'gt_labels_3d')),
 ]
 test_pipeline = [
-    dict(type='LoadMultiViewImageAndPoints', to_float32=True,
+    dict(type='LoadMultiViewImageAndPoints', to_float32=False,
          load_points=use_lidar,
          coord_type='LIDAR', load_dim=5, use_dim=4),
     dict(type='ResizeCropFlipRotImage', data_aug_conf=ida_aug_conf, training=False),

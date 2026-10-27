@@ -10,11 +10,21 @@
 #  Modified by Shihao Wang
 # ------------------------------------------------------------------------
 
+from concurrent.futures import ThreadPoolExecutor
+
 import numpy as np
 import mmcv
 from mmdet.datasets.builder import PIPELINES
 import torch
 from PIL import Image
+
+
+def _as_pil(image):
+    """几何变换走 PIL。uint8 直接包进去，float 再截回 0 到 255。"""
+    array = np.asarray(image)
+    if array.dtype != np.uint8:
+        array = np.clip(array, 0, 255).astype(np.uint8)
+    return Image.fromarray(np.ascontiguousarray(array))
 
 
 def _photo_color(images):
@@ -121,12 +131,18 @@ class ResizeCropFlipRotImage():
         self.min_size = 2.0
         self.with_2d = with_2d
         self.filter_invisible = filter_invisible
+        self._executor = None
+
+    def _pool(self, n_jobs):
+        workers = max(1, min(int(n_jobs), 6))
+        if self._executor is None:
+            self._executor = ThreadPoolExecutor(max_workers=workers)
+        return self._executor
 
     def __call__(self, results):
 
         imgs = results['img']
         N = len(imgs)
-        new_imgs = []
         new_gt_bboxes = []
         new_centers2d = []
         new_gt_labels = []
@@ -134,18 +150,12 @@ class ResizeCropFlipRotImage():
         assert self.data_aug_conf['rot_lim'] == (0.0, 0.0), "Rotation is not currently supported"
 
         resize, resize_dims, crop, flip, rotate = self._sample_augmentation()
-
+        # 6 路相机共用同一次增强。像素变换互相独立，和二维框处理并行。
+        image_jobs = [
+            self._pool(N).submit(self._warp_array, imgs[i], resize, resize_dims, crop, flip, rotate)
+            for i in range(N)]
 
         for i in range(N):
-            img = Image.fromarray(np.uint8(imgs[i]))
-            img, ida_mat = self._img_transform(
-                img,
-                resize=resize,
-                resize_dims=resize_dims,
-                crop=crop,
-                flip=flip,
-                rotate=rotate,
-            )
             if self.training and self.with_2d: # sync_2d bbox labels
                 gt_bboxes = results['gt_bboxes'][i]
                 centers2d = results['centers2d'][i]
@@ -169,7 +179,9 @@ class ResizeCropFlipRotImage():
                 new_gt_labels.append(gt_labels)
                 new_depths.append(depths)
 
-            new_imgs.append(np.array(img).astype(np.float32))
+        new_imgs = [job.result() for job in image_jobs]
+        ida_mat = self._ida_matrix(resize, crop, flip, rotate)
+        for i in range(N):
             results['intrinsics'][i][:3, :3] = ida_mat @ results['intrinsics'][i][:3, :3]
         results['gt_bboxes'] = new_gt_bboxes
         results['centers2d'] = new_centers2d
@@ -277,17 +289,22 @@ class ResizeCropFlipRotImage():
             ]
         )
 
-    def _img_transform(self, img, resize, resize_dims, crop, flip, rotate):
-        ida_rot = torch.eye(2)
-        ida_tran = torch.zeros(2)
-        # adjust image
+    def _warp_pixels(self, img, resize_dims, crop, flip, rotate):
         img = img.resize(resize_dims)
         img = img.crop(crop)
         if flip:
             img = img.transpose(method=Image.FLIP_LEFT_RIGHT)
         img = img.rotate(rotate)
+        return img
 
-        # post-homography transformation
+    def _warp_array(self, image, resize, resize_dims, crop, flip, rotate):
+        del resize
+        image = self._warp_pixels(_as_pil(image), resize_dims, crop, flip, rotate)
+        return np.asarray(image, dtype=np.float32)
+
+    def _ida_matrix(self, resize, crop, flip, rotate):
+        ida_rot = torch.eye(2)
+        ida_tran = torch.zeros(2)
         ida_rot *= resize
         ida_tran -= torch.Tensor(crop[:2])
         if flip:
@@ -303,7 +320,11 @@ class ResizeCropFlipRotImage():
         ida_mat = torch.eye(3)
         ida_mat[:2, :2] = ida_rot
         ida_mat[:2, 2] = ida_tran
-        return img, ida_mat
+        return ida_mat
+
+    def _img_transform(self, img, resize, resize_dims, crop, flip, rotate):
+        img = self._warp_pixels(img, resize_dims, crop, flip, rotate)
+        return img, self._ida_matrix(resize, crop, flip, rotate)
 
     def _sample_augmentation(self):
         H, W = self.data_aug_conf["H"], self.data_aug_conf["W"]

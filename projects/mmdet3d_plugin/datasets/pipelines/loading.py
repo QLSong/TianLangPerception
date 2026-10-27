@@ -12,6 +12,7 @@ from nuscenes.eval.common.utils import Quaternion
 from projects.mmdet3d_plugin.datasets.nuscenes_dataset import transform_points_lidar_to_ego
 
 _OCC_INDEX = {}
+_RESAMPLE_GRID = {}
 
 
 def _index_occ_root(occ_root):
@@ -27,32 +28,72 @@ def _index_occ_root(occ_root):
     return index
 
 
+def _axis_span(origin, voxel, size, src_origin, src_voxel, src_size):
+    """目标轴上每个格子中心对应的源下标。有效段必须连续。"""
+    centers = origin + (np.arange(size) + 0.5) * voxel
+    index = np.floor((centers - src_origin) / src_voxel).astype(np.int64)
+    valid = (index >= 0) & (index < src_size)
+    chosen = np.flatnonzero(valid)
+    if chosen.size == 0:
+        return None
+    start = int(chosen[0])
+    stop = int(chosen[-1]) + 1
+    if stop - start != chosen.size:
+        raise RuntimeError('占用重采样的有效下标不连续')
+    return index[valid], start, stop
+
+
+def _resample_grid(src_range, src_voxel, dst_range, dst_voxel, src_shape):
+    """最近邻下标只和网格有关，每个 worker 算一次。返回 (目标尺寸, 写入切片, 平坦下标)。"""
+    src_range = tuple(float(v) for v in src_range)
+    dst_range = tuple(float(v) for v in dst_range)
+    src_voxel = tuple(float(v) for v in np.broadcast_to(np.asarray(src_voxel, dtype=np.float64), (3,)))
+    dst_voxel = tuple(float(v) for v in np.broadcast_to(np.asarray(dst_voxel, dtype=np.float64), (3,)))
+    src_shape = tuple(int(v) for v in src_shape)
+    key = (src_range, src_voxel, dst_range, dst_voxel, src_shape)
+    cached = _RESAMPLE_GRID.get(key)
+    if cached is not None or key in _RESAMPLE_GRID:
+        return cached
+    expected = tuple(int(round((src_range[i + 3] - src_range[i]) / src_voxel[i])) for i in range(3))
+    if src_shape != expected:
+        raise RuntimeError('Occ3D 标签 {} 和源网格 {} 不一致'.format(src_shape, expected))
+    dst_size = tuple(int(round((dst_range[i + 3] - dst_range[i]) / dst_voxel[i])) for i in range(3))
+    axes = []
+    for i in range(3):
+        axis = _axis_span(
+            dst_range[i], dst_voxel[i], dst_size[i], src_range[i], src_voxel[i], src_shape[i])
+        if axis is None:
+            _RESAMPLE_GRID[key] = None
+            return None
+        axes.append(axis)
+    (sx, x0, x1), (sy, y0, y1), (sz, z0, z1) = axes
+    flat = (
+        sx[:, None, None] * (src_shape[1] * src_shape[2])
+        + sy[None, :, None] * src_shape[2]
+        + sz[None, None, :])
+    grid = (dst_size, (x0, x1, y0, y1, z0, z1), np.ascontiguousarray(flat))
+    _RESAMPLE_GRID[key] = grid
+    return grid
+
+
 def _resample_occ(semantics, mask, src_range, src_voxel, dst_range, dst_voxel, empty=17):
     """最近邻把 Occ3D 体素采到目标网格。落在源范围外的格子标成空，可见掩码为假。"""
-    src_range = np.asarray(src_range, dtype=np.float64)
-    dst_range = np.asarray(dst_range, dtype=np.float64)
-    src_voxel = np.broadcast_to(np.asarray(src_voxel, dtype=np.float64), (3,))
-    dst_voxel = np.broadcast_to(np.asarray(dst_voxel, dtype=np.float64), (3,))
-    dst_size = tuple(int(round((dst_range[i + 3] - dst_range[i]) / dst_voxel[i])) for i in range(3))
-    src_size = tuple(int(round((src_range[i + 3] - src_range[i]) / src_voxel[i])) for i in range(3))
-    if tuple(semantics.shape) != src_size:
-        raise RuntimeError('Occ3D 标签 {} 和源网格 {} 不一致'.format(semantics.shape, src_size))
-    axes = [
-        dst_range[i] + (np.arange(dst_size[i]) + 0.5) * dst_voxel[i]
-        for i in range(3)]
-    gx, gy, gz = np.meshgrid(axes[0], axes[1], axes[2], indexing='ij')
-    sx = np.floor((gx - src_range[0]) / src_voxel[0]).astype(np.int64)
-    sy = np.floor((gy - src_range[1]) / src_voxel[1]).astype(np.int64)
-    sz = np.floor((gz - src_range[2]) / src_voxel[2]).astype(np.int64)
-    valid = (
-        (sx >= 0) & (sx < src_size[0])
-        & (sy >= 0) & (sy < src_size[1])
-        & (sz >= 0) & (sz < src_size[2]))
+    grid = _resample_grid(src_range, src_voxel, dst_range, dst_voxel, semantics.shape)
+    if grid is None:
+        dst_range = np.asarray(dst_range, dtype=np.float64)
+        dst_voxel = np.broadcast_to(np.asarray(dst_voxel, dtype=np.float64), (3,))
+        dst_size = tuple(int(round((dst_range[i + 3] - dst_range[i]) / dst_voxel[i])) for i in range(3))
+        return (
+            np.full(dst_size, empty, dtype=semantics.dtype),
+            np.zeros(dst_size, dtype=bool))
+    dst_size, (x0, x1, y0, y1, z0, z1), flat = grid
+    semantics = np.ascontiguousarray(semantics).reshape(-1)
+    mask = np.ascontiguousarray(np.asarray(mask, dtype=bool)).reshape(-1)
     out = np.full(dst_size, empty, dtype=semantics.dtype)
     out_mask = np.zeros(dst_size, dtype=bool)
-    out[valid] = semantics[sx[valid], sy[valid], sz[valid]]
-    out_mask[valid] = np.asarray(mask, dtype=bool)[sx[valid], sy[valid], sz[valid]]
-    return np.ascontiguousarray(out), np.ascontiguousarray(out_mask)
+    out[x0:x1, y0:y1, z0:z1] = semantics[flat]
+    out_mask[x0:x1, y0:y1, z0:z1] = mask[flat]
+    return out, out_mask
 
 
 @PIPELINES.register_module()
@@ -135,16 +176,17 @@ class LoadMultiViewImageAndPoints:
             point_job = pool.submit(
                 _read_points, results['pts_filename'], self.load_dim, self.use_dim)
         images = [job.result() for job in image_jobs]
-        img = np.stack(images, axis=-1)
         if self.to_float32:
-            img = img.astype(np.float32)
+            images = [img.astype(np.float32, copy=False) for img in images]
         results['filename'] = filename
-        results['img'] = [img[..., i] for i in range(img.shape[-1])]
-        results['img_shape'] = img.shape
-        results['ori_shape'] = img.shape
-        results['pad_shape'] = img.shape
+        results['img'] = images
+        # 和原来 stack 到最后一维的形状一致：(高, 宽, 通道, 相机数)。
+        view_shape = images[0].shape + (len(images),)
+        results['img_shape'] = view_shape
+        results['ori_shape'] = view_shape
+        results['pad_shape'] = view_shape
         results['scale_factor'] = 1.0
-        num_channels = 1 if len(img.shape) < 3 else img.shape[2]
+        num_channels = 1 if images[0].ndim < 3 else images[0].shape[2]
         results['img_norm_cfg'] = dict(
             mean=np.zeros(num_channels, dtype=np.float32),
             std=np.ones(num_channels, dtype=np.float32),

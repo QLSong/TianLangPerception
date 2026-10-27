@@ -188,11 +188,14 @@ class StreamPETRFusion(Petr3D):
                  max_points=32,
                  tasks='both',
                  use_lidar=True,
+                 det_from_view=False,
                  lidar_bev_channels=384,
                  **kwargs):
         super().__init__(**kwargs)
         self.tasks = parse_tasks(tasks)
         self.use_lidar = bool(use_lidar)
+        # 检测交叉注意力读 PlaneViewTransformer 的 BEV，不再读原图 token。
+        self.det_from_view = bool(det_from_view)
         self.lidar_backbone = build_backbone(pts_backbone) if pts_backbone else None
         self.img_view_transformer = build_neck(img_view_transformer) if img_view_transformer else None
         self.bev_backbone = build_mmseg_backbone(bev_backbone) if bev_backbone else None
@@ -229,7 +232,9 @@ class StreamPETRFusion(Petr3D):
         _set_requires_grad(self.lidar_opus_proj, self.use_lidar and train_occ)
         _set_requires_grad(self.pts_bbox_head, train_det)
         _freeze_det_constants(self.pts_bbox_head)
-        _set_requires_grad(self.img_view_transformer, train_occ)
+        _set_requires_grad(
+            self.img_view_transformer,
+            train_occ or (train_det and self.det_from_view))
         _set_requires_grad(self.bev_backbone, train_occ)
         _set_requires_grad(self.bev_neck, train_occ)
         _set_requires_grad(self.occ_head, train_occ)
@@ -292,20 +297,28 @@ class StreamPETRFusion(Petr3D):
         coords = torch.stack(coords, 0)
         return self.lidar_backbone(pillars, coords)
 
-    def _lss_inputs(self, img_feats, extrinsics, intrinsics):
-        """外参是自车到相机。LSS 的 BEV 落在自车坐标，x 朝前、y 朝左。"""
+    def _lss_inputs(self, img_feats, extrinsics, intrinsics, distortion=None):
+        """外参是自车到相机。LSS 的 BEV 落在自车坐标，x 朝前、y 朝左。
+
+        distortion 是 (B, N, 8) 时，IPM 在乘内参前做 rational 畸变。
+        """
         b, n = img_feats.shape[:2]
         device = img_feats.device
         if extrinsics.dim() == 5:
             extrinsics = extrinsics[:, -1]
             intrinsics = intrinsics[:, -1]
+            if distortion is not None and distortion.dim() == 4:
+                distortion = distortion[:, -1]
         sensor2ego = torch.linalg.inv(extrinsics)
         ego2global = torch.eye(4, device=device).view(1, 1, 4, 4).repeat(b, n, 1, 1)
         cam2imgs = intrinsics[..., :3, :3]
         post_rots = torch.eye(3, device=device).view(1, 1, 3, 3).repeat(b, n, 1, 1)
         post_trans = torch.zeros(b, n, 3, device=device)
         bda = torch.eye(3, device=device).unsqueeze(0).repeat(b, 1, 1)
-        return [img_feats, sensor2ego, ego2global, cam2imgs, post_rots, post_trans, bda]
+        packed = [img_feats, sensor2ego, ego2global, cam2imgs, post_rots, post_trans, bda]
+        if distortion is not None:
+            packed.append(distortion.to(device=device, dtype=img_feats.dtype))
+        return packed
 
     def _build_occ_head(self, occ_head):
         occ_head = occ_head.copy()
@@ -380,11 +393,45 @@ class StreamPETRFusion(Petr3D):
             raise RuntimeError('OPUS lidar sampling is on but the batch has no lidar BEV')
         return self.lidar_opus_proj(lidar_bev)
 
-    def forward_occ(self, img_feats, data, lidar_bev=None):
+    def _camera_bev(self, img_feats, extrinsics, intrinsics, distortion=None):
+        """PlaneViewTransformer 的输出。有时间维时逐帧投，返回 (B, T, C, Y, X)。"""
+        if self.img_view_transformer is None:
+            raise RuntimeError('需要 img_view_transformer 才能得到相机 BEV')
+        if img_feats.dim() == 5:
+            bev, _ = self.img_view_transformer(
+                self._lss_inputs(img_feats, extrinsics, intrinsics, distortion))
+            return bev
+        if img_feats.dim() != 6:
+            raise RuntimeError('图像特征维度是 {}'.format(tuple(img_feats.shape)))
+        frames = []
+        for t in range(img_feats.size(1)):
+            ext = extrinsics[:, t] if extrinsics.dim() == 5 else extrinsics
+            intr = intrinsics[:, t] if intrinsics.dim() == 5 else intrinsics
+            dist = None
+            if distortion is not None:
+                dist = distortion[:, t] if distortion.dim() == 4 else distortion
+            bev, _ = self.img_view_transformer(
+                self._lss_inputs(img_feats[:, t], ext, intr, dist))
+            frames.append(bev)
+        return torch.stack(frames, 1)
+
+    def _attach_det_bev(self, img_feats, data):
+        if not self.det_from_view:
+            return None
+        camera_bev = self._camera_bev(
+            img_feats, data['extrinsics'], data['intrinsics'], data.get('distortion'))
+        data['img_bev'] = camera_bev
+        return camera_bev
+
+    def forward_occ(self, img_feats, data, lidar_bev=None, camera_bev=None):
         if self.img_view_transformer is None:
             return None
-        bev, _ = self.img_view_transformer(
-            self._lss_inputs(img_feats, data['extrinsics'], data['intrinsics']))
+        if camera_bev is None:
+            camera_bev = self._camera_bev(
+                img_feats, data['extrinsics'], data['intrinsics'], data.get('distortion'))
+        if camera_bev.dim() == 5:
+            camera_bev = camera_bev[:, -1]
+        bev = camera_bev
         if self.use_lidar:
             if lidar_bev is None or self.lidar_occ_fuse is None:
                 raise RuntimeError('use_lidar is on but occupancy has no lidar BEV')
@@ -419,6 +466,7 @@ class StreamPETRFusion(Petr3D):
         data['img_feats'] = rec_img_feats
         losses = dict()
         lidar_bev = self._prepare_lidar(points) if self._needs_lidar() else None
+        camera_bev = self._attach_det_bev(data['img_feats'], data) if train_det else None
         if train_det:
             if lidar_bev is not None:
                 data['lidar_bev'] = lidar_bev.unsqueeze(1).repeat(1, t, 1, 1, 1)
@@ -454,7 +502,11 @@ class StreamPETRFusion(Petr3D):
                     (data['img'].shape[-2], data['img'].shape[-1]))
                 losses.update(self.occ_head.loss(occ, voxel_semantics, mask_camera))
             else:
-                occ = self.forward_occ(data['img_feats'][:, -1], data, lidar_bev)
+                last_bev = None
+                if camera_bev is not None:
+                    last_bev = camera_bev[:, -1] if camera_bev.dim() == 5 else camera_bev
+                occ = self.forward_occ(
+                    data['img_feats'][:, -1], data, lidar_bev, camera_bev=last_bev)
                 losses.update(self.occ_head.loss(occ, voxel_semantics, mask_camera))
         return _keep_task_losses(losses, self.tasks)
 
@@ -470,6 +522,7 @@ class StreamPETRFusion(Petr3D):
         bbox_list = [dict() for _ in range(len(img_metas))]
         need_lidar = self._needs_lidar()
         lidar_bev = self._prepare_lidar(self._points_for_test(data.get('points'))) if need_lidar else None
+        camera_bev = self._attach_det_bev(data['img_feats'], data) if 'det' in self.tasks else None
         if 'det' in self.tasks:
             if lidar_bev is not None:
                 data['lidar_bev'] = lidar_bev
@@ -489,7 +542,7 @@ class StreamPETRFusion(Petr3D):
                 feats = data['img_feats']
                 if feats.dim() == 6:
                     feats = feats[:, -1]
-                occ = self.forward_occ(feats, data, lidar_bev)
+                occ = self.forward_occ(feats, data, lidar_bev, camera_bev=camera_bev)
                 occ_preds = self.occ_head.get_occ(occ, img_metas)
             for result_dict, occ_pred in zip(bbox_list, occ_preds):
                 result_dict['occ'] = occ_pred

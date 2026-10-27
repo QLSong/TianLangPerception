@@ -8,8 +8,10 @@ import platform
 import random
 from functools import partial
 
+import cv2
 import numpy as np
-from mmcv.parallel import collate
+import torch
+from mmcv.parallel import DataContainer, collate
 from mmcv.runner import get_dist_info
 from mmcv.utils import Registry, build_from_cfg
 from torch.utils.data import DataLoader
@@ -101,8 +103,7 @@ def build_dataloader(dataset,
 
 
     init_fn = partial(
-        worker_init_fn, num_workers=num_workers, rank=rank,
-        seed=seed) if seed is not None else None
+        worker_init_fn, num_workers=num_workers, rank=rank, seed=seed)
 
     # num_workers 为 0 时 PyTorch 不接受 prefetch_factor / persistent_workers。
     if num_workers > 0:
@@ -112,6 +113,7 @@ def build_dataloader(dataset,
         kwargs.pop('prefetch_factor', None)
         kwargs.pop('persistent_workers', None)
 
+    _install_container_pin_memory()
     data_loader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -119,14 +121,49 @@ def build_dataloader(dataset,
         batch_sampler=batch_sampler,
         num_workers=num_workers,
         collate_fn=partial(collate, samples_per_gpu=samples_per_gpu),
-        pin_memory=False,
+        pin_memory=True,
         worker_init_fn=init_fn,
         **kwargs)
 
     return data_loader
 
 
+def _pin_loaded_batch(data, device=None):
+    if isinstance(data, torch.Tensor):
+        if data.device.type == 'cpu' and not data.is_pinned():
+            return data.pin_memory(device)
+        return data
+    if isinstance(data, list):
+        return [_pin_loaded_batch(value, device) for value in data]
+    if isinstance(data, tuple):
+        return tuple(_pin_loaded_batch(value, device) for value in data)
+    return data
+
+
+def _data_container_pin_memory(container, device=None):
+    """DataLoader 只会调用容器自己的 pin_memory。cpu_only 的 meta 留在页内存里。"""
+    if container.cpu_only:
+        return container
+    return DataContainer(
+        _pin_loaded_batch(container.data, device),
+        container.stack,
+        container.padding_value,
+        cpu_only=False,
+        pad_dims=container.pad_dims)
+
+
+def _install_container_pin_memory():
+    if getattr(DataContainer, '_tianlang_pin_memory', False):
+        return
+    DataContainer.pin_memory = _data_container_pin_memory
+    DataContainer._tianlang_pin_memory = True
+
+
 def worker_init_fn(worker_id, num_workers, rank, seed):
+    # OpenCV 默认按机器核数开线程。4 个 worker 再各开 6 路解码时会把核抢光。
+    cv2.setNumThreads(1)
+    if seed is None:
+        return
     # The seed of each worker equals to
     # num_worker * rank + worker_id + user_seed
     worker_seed = num_workers * rank + worker_id + seed
