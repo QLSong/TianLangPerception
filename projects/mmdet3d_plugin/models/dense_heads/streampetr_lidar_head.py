@@ -38,6 +38,8 @@ class StreamPETRLidarHead(StreamPETRHead):
                  use_img_bev=False, img_bev_channels=64, img_bev_num_points=4, **kwargs):
         super().__init__(**kwargs)
         self.use_img_bev = bool(use_img_bev)
+        # False 时检测只看雷达 BEV，跳过图像交叉注意力。
+        self.attend_image = True
         # 历史框等到第 0 层 refine 之后再拼进来，temporal_alignment 里先不拼接。
         self.defer_temporal = True
         # PointPillars 输出 384 通道，压到和图像 query 相同的 embed_dims。
@@ -101,7 +103,7 @@ class StreamPETRLidarHead(StreamPETRHead):
             self, layer, lidar_attn, lidar_ln, query, key, value,
             query_pos, key_pos, temp_memory, temp_pos, attn_masks,
             lidar_key, lidar_hw, reference_points, lidar2img, img_hw, img_pad,
-            img_bev_key=None, img_bev_hw=None, img_bev_attn=None):
+            img_bev_key=None, img_bev_hw=None, img_bev_attn=None, attend_image=True):
         """跑一层 decoder，并在图像交叉注意力的 LayerNorm 之后加上 BEV 注意力。
 
         配置里的 operation_order 是 self_attn、norm、cross_attn、norm、ffn、norm。
@@ -152,7 +154,7 @@ class StreamPETRLidarHead(StreamPETRHead):
                     identity = query
                     after_image = False
             elif op == 'cross_attn':
-                if img_bev_key is not None:
+                if attend_image and img_bev_key is not None:
                     # xy 按检测 pc_range 归一化，和相机 BEV 是同一块范围。
                     query = img_bev_attn(
                         query, value=img_bev_key,
@@ -160,7 +162,7 @@ class StreamPETRLidarHead(StreamPETRHead):
                         query_pos=query_pos,
                         reference_points=reference_points[..., :2],
                         spatial_hw=img_bev_hw)
-                else:
+                elif attend_image:
                     query = layer.attentions[attn_index](
                         query, key, value,
                         identity if layer.pre_norm else None,
@@ -307,7 +309,8 @@ class StreamPETRLidarHead(StreamPETRHead):
     def _run_temporal_decoder(
             self, memory, tgt, query_pos, pos_embed, attn_mask,
             temp_memory, temp_pos, lidar_bev, reference_points,
-            lidar2img, img_hw, img_pad, prev_exists, pad, img_bev=None):
+            lidar2img, img_hw, img_pad, prev_exists, pad, img_bev=None,
+            attend_image=True):
         """逐层解码。第 0 层结束时插入历史框，之后每层用新中心刷新位置编码。
 
         进来的 memory、tgt、query_pos、pos_embed 都是 batch 在前，这里转成
@@ -360,7 +363,8 @@ class StreamPETRLidarHead(StreamPETRHead):
                 [later_mask if use_memory else attn_mask, None],
                 lidar_mem, lidar_hw, reference_points, lidar2img, img_hw, img_pad,
                 img_bev_key, img_bev_hw,
-                None if img_bev_key is None else self.img_bev_cross_attn[i])
+                None if img_bev_key is None else self.img_bev_cross_attn[i],
+                attend_image)
             # post_norm 只进入这一层的输出和预测头。下一层仍从原始 query 接着算。
             hidden = decoder.post_norm(query) if decoder.post_norm is not None else query
             intermediate.append(hidden)
@@ -392,14 +396,25 @@ class StreamPETRLidarHead(StreamPETRHead):
         """
         # 把 memory 从上一帧的全局坐标变回当前自车。场景切换时 prev_exists 为 0，会清掉。
         self.pre_update_memory(data)
-        img_bev = data.get('img_bev') if self.use_img_bev else None
-        if self.use_img_bev:
+        attend_image = self.attend_image
+        img_bev = data.get('img_bev') if self.use_img_bev and attend_image else None
+        if attend_image and self.use_img_bev:
             if img_bev is None:
                 raise RuntimeError('检测头需要 img_view_transformer 的 BEV，batch 里没有 img_bev')
             if img_bev.dim() == 5:
                 img_bev = img_bev[:, -1]
             b = img_bev.shape[0]
             memory = img_bev.new_zeros(b, 1, self.embed_dims)
+            pos_embed = memory
+        elif not attend_image:
+            lidar_bev = data.get('lidar_bev')
+            if lidar_bev is None:
+                raise RuntimeError('单雷达检测没有 lidar_bev')
+            if lidar_bev.dim() == 5:
+                lidar_bev = lidar_bev[:, -1]
+                data['lidar_bev'] = lidar_bev
+            b = lidar_bev.shape[0]
+            memory = lidar_bev.new_zeros(b, 1, self.embed_dims)
             pos_embed = memory
         else:
             x = data['img_feats']
@@ -420,7 +435,7 @@ class StreamPETRLidarHead(StreamPETRHead):
         # defer_temporal 为真时，这里只准备历史 memory，不把它拼到当前 query 上。
         tgt, query_pos, reference_points, temp_memory, temp_pos, _ = (
             self.temporal_alignment(query_pos, tgt, reference_points))
-        if self.use_img_bev:
+        if self.use_img_bev or not attend_image:
             lidar2img, img_hw, img_pad = None, None, None
         else:
             lidar2img = data['lidar2img']
@@ -432,7 +447,8 @@ class StreamPETRLidarHead(StreamPETRHead):
         outs_dec, all_cls_scores, all_bbox_preds = self._run_temporal_decoder(
             memory, tgt, query_pos, pos_embed, attn_mask,
             temp_memory, temp_pos, data.get('lidar_bev'), reference_points,
-            lidar2img, img_hw, img_pad, data['prev_exists'], pad, img_bev)
+            lidar2img, img_hw, img_pad, data['prev_exists'], pad, img_bev,
+            attend_image)
         outs_dec = torch.nan_to_num(outs_dec)
         all_cls_scores = torch.nan_to_num(all_cls_scores)
         all_bbox_preds = torch.nan_to_num(all_bbox_preds)

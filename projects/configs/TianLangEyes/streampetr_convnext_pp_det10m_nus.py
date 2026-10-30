@@ -13,28 +13,30 @@ use_img_deform_attn = True
 # 检测不从原图特征取 token，改为接 img_view_transformer 输出的相机 BEV。
 det_from_view = True
 _view_channels = 64
-# 关掉后检测和占用都不再读点云。打开时两个任务共用 PointPillars BEV。
-use_lidar = False
+# 单视觉：use_camera=True, use_lidar=False。单雷达：反过来。
+# 两路都开时，检测看雷达 BEV，占用把雷达 BEV 加到相机 BEV 上。
+use_camera = True
+use_lidar = True
+# 图像骨干和雷达骨干分开冻。True 时该骨干权重不更新，并保持 eval。
+freeze_img_backbone = True
+freeze_lidar_backbone = False
 # 检测跨帧 memory。False 时 query 只看当前帧，不传播历史框，也不写 memory。
 # True 时第一层只用当前帧，refine 后用历史框换掉低分 query，之后每层把预测中心写回采样点。
 use_det_temporal = False
 data_root = './data/nuscenes/'
 occ_root = data_root + 'gts/'
 
-# 检测框前后左右各 9.6 m。0.2 m 柱子画布是 96×96，能被 8 整除。
-# 检测 z 仍是 [-5, 3]。SECOND+FPN 输出格子是 pillar 的 2 倍（0.4 m，48×48）。
+# 检测框前后左右各 9.6 m。0.1 m 柱子画布是 192×192。
+# 检测 z 仍是 [-5, 3]。SECOND 第一层 stride 2，FPN 对齐到 96×96，输出每格 0.2 m。
 # position_range 比检测框四周再扩 10 m，给图像位置编码留白。
 # 占用单独用 0.1 m 格子：xy 同样 ±9.6 m（192×192），z 从 -2 m 到 1 m（30 层）。
-# point_cloud_range = [-9.6, -9.6, -5.0, 9.6, 9.6, 3.0]
-point_cloud_range = [-9.6, -9.6, -5.5, 9.6, 9.6, 2.5]
-position_range = [-19.6, -19.6, -10.0, 19.6, 19.6, 10.0]
-lidar_pc_range = [-9.6, -9.6, -5.0, 9.6, 9.6, 3.0]
-voxel_size = [0.2, 0.2, 8]
-lidar_voxel_size = [0.2, 0.2, 8.0]
+point_cloud_range = [-9.6, -9.6, -3.0, 9.6, 9.6, 3.0]
+position_range = [-19.6, -19.6, -5.0, 19.6, 19.6, 5.0]
+lidar_pc_range = [-9.6, -9.6, -3.0, 9.6, 9.6, 3.0]
+lidar_voxel_size = [0.1, 0.1, 6.0]
 _pillar_nx = int(round((lidar_pc_range[3] - lidar_pc_range[0]) / lidar_voxel_size[0]))
 _pillar_ny = int(round((lidar_pc_range[4] - lidar_pc_range[1]) / lidar_voxel_size[1]))
-# occ_range = [-9.6, -9.6, -2.0, 9.6, 9.6, 1.0]
-occ_range = [-9.6, -9.6, -2.5, 9.6, 9.6, 0.5]
+occ_range = [-9.6, -9.6, -2.0, 9.6, 9.6, 1.0]
 occ_voxel = [0.1, 0.1, 0.1]
 _occ_dz = int(round((occ_range[5] - occ_range[2]) / occ_voxel[2]))
 img_norm_cfg = dict(
@@ -61,13 +63,16 @@ collect_keys = [
     'img_timestamp', 'ego_pose', 'ego_pose_inv'
 ]
 input_modality = dict(
-    use_lidar=use_lidar, use_camera=True,
+    use_lidar=use_lidar, use_camera=use_camera,
     use_radar=False, use_map=False, use_external=True)
 
 model = dict(
     type='StreamPETRFusion',
     tasks=task,
     use_lidar=use_lidar,
+    use_camera=use_camera,
+    freeze_img_backbone=freeze_img_backbone,
+    freeze_lidar_backbone=freeze_lidar_backbone,
     det_from_view=det_from_view,
     num_frame_head_grads=1,
     num_frame_backbone_grads=1,
@@ -77,13 +82,13 @@ model = dict(
     position_level=0,
     lidar_pc_range=lidar_pc_range,
     lidar_voxel_size=lidar_voxel_size,
-    max_voxels=12000,
+    max_voxels=_pillar_nx * _pillar_ny,
     max_points=32,
     img_backbone=dict(
         type='ConvNeXt',
         arch='tiny',
         out_indices=(2, 3),
-        frozen=True,
+        frozen=freeze_img_backbone,
         pretrained='ckpts/dinov3_convnext_tiny_lvd1689m.safetensors'),
     img_neck=dict(type='CPFPN', in_channels=[384, 768], out_channels=256, num_outs=2),
     pts_backbone=dict(type='PointPillars', ny=_pillar_ny, nx=_pillar_nx),
@@ -174,14 +179,12 @@ model = dict(
             post_center_range=position_range,
             pc_range=point_cloud_range,
             max_num=128,
-            voxel_size=voxel_size,
             num_classes=len(class_names)),
         loss_cls=dict(type='FocalLoss', use_sigmoid=True, gamma=2.0, alpha=0.25, loss_weight=2.0),
         loss_bbox=dict(type='L1Loss', loss_weight=0.25),
         loss_iou=dict(type='GIoULoss', loss_weight=0.0)),
     train_cfg=dict(pts=dict(
         grid_size=[_pillar_nx, _pillar_ny, 1],
-        voxel_size=voxel_size,
         point_cloud_range=point_cloud_range,
         out_size_factor=4,
         assigner=dict(
@@ -281,5 +284,5 @@ evaluation = dict(interval=num_iters_per_epoch * num_epochs, pipeline=test_pipel
 find_unused_parameters = True
 checkpoint_config = dict(interval=num_iters_per_epoch, max_keep_ckpts=3)
 runner = dict(type='IterBasedRunner', max_iters=num_epochs * num_iters_per_epoch)
-load_from = None
+load_from = 'work_dirs/streampetr_convnext_pp_det10m_nus/iter_45000_img_nuscenes.pth'
 resume_from = None
